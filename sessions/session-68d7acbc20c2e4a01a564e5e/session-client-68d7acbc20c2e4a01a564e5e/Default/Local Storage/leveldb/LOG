@@ -1,0 +1,6 @@
+2025/10/18-16:37:32.209 4812b Reusing MANIFEST /home/ankit/Desktop/DOS/Projects/new-whatsapp-broadcast/backend/sessions/session-68d7acbc20c2e4a01a564e5e/session-client-68d7acbc20c2e4a01a564e5e/Default/Local Storage/leveldb/MANIFEST-000001
+2025/10/18-16:37:32.211 4812b Recovering log #3
+2025/10/18-16:37:32.211 4812b Reusing old log /home/ankit/Desktop/DOS/Projects/new-whatsapp-broadcast/backend/sessions/session-68d7acbc20c2e4a01a564e5e/session-client-68d7acbc20c2e4a01a564e5e/Default/Local Storage/leveldb/000003.log 
+2025/10/18-16:47:40.513 49e64 Level-0 table #5: started
+2025/10/18-16:47:40.517 49e64 Level-0 table #5: 18864 bytes OK
+2025/10/18-16:47:40.519 49e64 Delete type=0 #3
