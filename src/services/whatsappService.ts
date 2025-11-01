@@ -49,7 +49,7 @@ class WhatsAppService {
   private async restoreExistingConnections() {
     try {
       // Import User model dynamically to avoid circular dependencies
-      const User = (await import('../models/User.js')).default as any;
+      const User = require('../models/User').default as any;
 
       // Find all users with active WhatsApp connections
       const connectedUsers = await User.find({
@@ -450,7 +450,7 @@ class WhatsAppService {
 
         // Update database with connection status
         try {
-          const User = (await import('../models/User.js')).default as any;
+          const User = require('../models/User').default as any;
           await User.findByIdAndUpdate(userId, {
             whatsappConnected: true,
             whatsappSessionId: `session-${userId}`
@@ -497,7 +497,7 @@ class WhatsAppService {
 
         // Update database with auth failure status
         try {
-          const User = (await import('../models/User.js')).default as any;
+          const User = require('../models/User').default as any;
           await User.findByIdAndUpdate(userId, {
             whatsappConnected: false,
             whatsappSessionId: null
@@ -548,7 +548,7 @@ class WhatsAppService {
 
         // Update database with disconnection status
         try {
-          const User = (await import('../models/User.js')).default as any;
+          const User = require('../models/User').default as any;
           await User.findByIdAndUpdate(userId, {
             whatsappConnected: false,
             whatsappSessionId: null
