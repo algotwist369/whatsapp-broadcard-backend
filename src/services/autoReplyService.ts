@@ -1,592 +1,351 @@
-import AutoReply from '../models/AutoReply';
-import AutoReplyLog from '../models/AutoReplyLog';
-// Removed: ReplyData - No longer using manual data entry
-import Contact from '../models/Contact';
+import OpenAI from 'openai';
+import SpaData from '../models/SpaData';
+import ConversationState from '../models/ConversationState';
 import ConversationHistory from '../models/ConversationHistory';
-import aiService from './aiService';
 import whatsappService from './whatsappService';
-import ragService from './ragService';
+import env from '../config/env';
 
-interface AutoReplyContext {
-  contactName: string;
-  contactCategory?: string;
-  previousMessages: number;
-  messageTime: Date;
-  messageLength: number;
-}
+const openai = new OpenAI({ apiKey: env.OPENAI_API_KEY });
 
-interface AutoReplyResult {
-  shouldReply: boolean;
-  response?: string;
-  autoReplyId?: string;
-  confidence?: number;
-  processingTime?: number;
-  error?: string;
-}
+const ADULT_KEYWORDS = ['sex', 'sexy', 'nude', 'naked', 'adult', 'escort', 'call girl', 'gf', 'bf', 'private', 'extra service', 'happy ending', 'full body', 'body to body'];
+const ABUSIVE_WORDS = ['chor', 'bakwas', 'fraud', 'scam', 'ghatiya', 'madarchod', 'bhenchod', 'gandu', 'kutta'];
+const THERAPIST_KEYWORDS = ['therapist', 'masseuse', 'staff', 'employee', 'age', 'pic', 'photo', 'image']; // FIXED: Removed 'massage' to avoid service overlap
+const SPAM_PATTERNS = [/^hi+$/i, /^hello+$/i, /^\?+$/, /^\.+$/, /^\d+$/, /^yes+$/i, /^no+$/i];
 
-class AutoReplyService {
-  private activeAutoReplies: Map<string, any[]> = new Map();
-  // Removed: replyDataCache - No longer using manual data
-  private cacheExpiry: Map<string, number> = new Map();
-  private readonly CACHE_TTL = 300000; // 5 minutes cache
-  private processingQueue: Map<string, Promise<any>> = new Map(); // Prevent duplicate processing
+class SmartSpaManager {
+  private ASSISTANT_PERSONA = `You are Kiara, a 35-year-old senior spa manager with 20+ years of experience. 
+  You are warm, professional, persuasive, and excellent at converting inquiries into bookings. 
+  You speak in natural Hindi-English mix (Hinglish) or English like real Indian spa managers—detect user's language and respond accordingly.
+  You remember everything the customer said. You never repeat. You always end with a question to keep conversation going.
+  Your goal: Get booking confirmed. Use urgency, benefits, trust, discounts. Be empathetic and human-like—add emojis sparingly, vary phrasing.
+  For therapist queries: Always say we have female and professional therapists.
+  For adult/extras: Politely redirect to admin phone without engaging.
+  If user hits 100 msgs/day: Say "Main aapko manager se connect kar rahi hu, wait kijiye" and notify admin.
+  Always push for booking subtly.`;
 
-  constructor() {
-    this.startCacheCleanup();
+  private async getSpaContext(userId: string) {
+    const spa = await SpaData.findOne({ userId });
+    if (!spa) throw new Error("Spa not found");
+    return {
+      spaName: spa.spaName,
+      location: spa.location,
+      address: spa.address,
+      phone: spa.phone,
+      // Use centralized env for fallback admin phone
+      adminPhone: spa.adminPhone || spa.phone || env.ADMIN_PHONE || '7388480128',
+      mapUrl: spa.mapUrl,
+      discounts: spa.discounts || 'First visit 20% off, next 10% off',
+      services: spa.services.map((s: any) => ({
+        name: s.name,
+        description: s.description,
+        variants: s.variants.map((v: any) => `${v.duration} min - ₹${v.price}`).join(', '),
+        benefits: s.benefits
+      })),
+      workingHours: spa.workingHours.find(h => h.isOpen)?.openTime + ' - ' + spa.workingHours.find(h => h.isOpen)?.closeTime
+    };
   }
 
-  private startCacheCleanup(): void {
-    setInterval(() => {
-      const now = Date.now();
-      for (const [key, expiry] of this.cacheExpiry.entries()) {
-        if (expiry < now) {
-          this.activeAutoReplies.delete(key);
-          // Removed: replyDataCache cleanup
-          this.cacheExpiry.delete(key);
-        }
-      }
-    }, 60000); // Clean up every minute
+  private async saveHistory(userId: string, phone: string, type: 'incoming' | 'outgoing', msg: string, step: string, ai?: string) {
+    await ConversationHistory.create({ userId, customerPhone: phone, messageType: type, message: msg, aiResponse: ai, step, timestamp: new Date() });
   }
 
-  async processIncomingMessage(
-    userId: string,
-    phoneNumber: string,
-    incomingMessage: string
-  ): Promise<AutoReplyResult> {
-    const startTime = Date.now();
-    
-    // Check if already processing this exact message (prevent duplicates)
-    const queueKey = `${userId}:${phoneNumber}:${incomingMessage.substring(0, 50)}`;
-    if (this.processingQueue.has(queueKey)) {
-      console.log(`⏭️ Already processing similar message for ${phoneNumber}, skipping`);
-      return { shouldReply: false };
+  private async send(userId: string, phone: string, msg: string, step: string) {
+    if (typeof whatsappService.sendChatState === 'function') {
+      await whatsappService.sendChatState(userId, phone, 'typing');
+      await new Promise(r => setTimeout(r, 800 + Math.random() * 1200));
     }
-    
-    try {
-      console.log(`🤖 Processing auto-reply for user ${userId}, phone: ${phoneNumber}`);
-      
-      // Mark as processing
-      const processingPromise = (async () => {
-        // Get or load active auto-replies for user (cached)
-        const autoReplies = await this.getActiveAutoReplies(userId);
-        if (autoReplies.length === 0) {
-          console.log('No active auto-replies found for user');
-          return { shouldReply: false };
-        }
-        
-        return autoReplies;
-      })();
-      
-      this.processingQueue.set(queueKey, processingPromise);
-      const autoReplies = await processingPromise;
-      
-      if (!Array.isArray(autoReplies) || autoReplies.length === 0) {
-        return { shouldReply: false };
-      }
 
-      // Check if there's an AI auto-reply rule
-      const aiAutoReply = autoReplies.find(ar => ar.responseType === 'ai_generated' && ar.isActive);
-      if (aiAutoReply) {
-        console.log('🎯 AI Auto-reply found, processing with AI...');
-        return await this.processAIAutoReply(aiAutoReply, userId, phoneNumber, incomingMessage, startTime);
-      }
-
-      // Get contact information
-      const contact = await Contact.findOne({
-        userId,
-        phone: phoneNumber,
-        isActive: true
-      });
-
-      const contextData: AutoReplyContext = {
-        contactName: contact?.name || 'Customer',
-        contactCategory: contact?.category || 'general',
-        previousMessages: await this.getPreviousMessageCount(userId, phoneNumber),
-        messageTime: new Date(),
-        messageLength: incomingMessage.length
-      };
-
-      // Check each auto-reply rule
-      for (const autoReply of autoReplies) {
-        const shouldTrigger = await this.shouldTriggerAutoReply(
-          autoReply,
-          incomingMessage,
-          contextData
-        );
-
-        if (shouldTrigger) {
-          console.log(`🎯 Auto-reply triggered: ${autoReply.name}`);
-          
-          const response = await this.generateResponse(
-            autoReply,
-            incomingMessage,
-            contextData
-          );
-
-          if (response) {
-            // Log the auto-reply
-            await this.logAutoReply(
-              userId,
-              autoReply._id.toString(),
-              contact?._id?.toString(),
-              incomingMessage,
-              autoReply.responseTemplate,
-              response,
-              autoReply.responseType,
-              'success',
-              Date.now() - startTime
-            );
-
-            // Update statistics
-            await this.updateAutoReplyStats(autoReply._id.toString(), true);
-
-            return {
-              shouldReply: true,
-              response,
-              autoReplyId: autoReply._id.toString(),
-              confidence: 0.85,
-              processingTime: Date.now() - startTime
-            };
-          }
-        }
-      }
-
-      console.log('No auto-reply triggered for this message');
-      return { shouldReply: false };
-
-    } catch (error) {
-      console.error('Error processing auto-reply:', error);
-      return {
-        shouldReply: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
-      };
-    } finally {
-      // Clean up processing queue
-      this.processingQueue.delete(queueKey);
+    await this.saveHistory(userId, phone, 'outgoing', msg, step, msg);
+    await whatsappService.sendMessage(userId, phone, msg);
+    if (typeof whatsappService.sendChatState === 'function') {
+      await whatsappService.sendChatState(userId, phone, 'paused');
     }
   }
 
-  private async processAIAutoReply(
-    aiAutoReply: any,
-    userId: string,
-    phoneNumber: string,
-    incomingMessage: string,
-    startTime: number
-  ): Promise<AutoReplyResult> {
-    try {
-      // Get contact information
-      const contact = await Contact.findOne({
-        userId,
-        phone: phoneNumber,
-        isActive: true
-      });
-
-      // Get or create conversation history
-      let conversation = await ConversationHistory.findOne({
-        userId,
-        phoneNumber,
-        isActive: true
-      });
-
-      if (!conversation) {
-        conversation = new ConversationHistory({
-          userId,
-          phoneNumber,
-          contactId: contact?._id,
-          messages: [],
-          messageCount: 0,
-          isActive: true
-        });
-      }
-
-      // Add incoming message to conversation
-      (conversation as any).addMessage('user', incomingMessage);
-
-      // Get recent conversation context (last 5 messages)
-      const recentMessages = (conversation as any).getRecentMessages(5);
-
-      const contextData: AutoReplyContext = {
-        contactName: contact?.name || 'Customer',
-        contactCategory: contact?.category || 'general',
-        previousMessages: conversation.messageCount,
-        messageTime: new Date(),
-        messageLength: incomingMessage.length
-      };
-
-      // ✅ ONLY USE UPLOADED PDFs - NO MANUAL DATA
-      console.log(`📚 Checking for uploaded PDF knowledge base...`);
-      
-      const knowledgeSummary = await ragService.getUserKnowledgeSummary(userId);
-      
-      if (knowledgeSummary.totalDocuments === 0) {
-        console.log(`❌ No PDFs uploaded! Auto-reply requires uploaded business documents.`);
-        
-        // Log to auto-reply for tracking
-        await this.logAutoReply(
-          userId,
-          aiAutoReply._id.toString(),
-          undefined,
-          incomingMessage,
-          'No PDFs uploaded',
-          'Please upload business PDFs in Knowledge Base to enable auto-replies.',
-          'ai_generated',
-          'failed',
-          Date.now() - startTime
-        );
-        
-        return {
-          shouldReply: false,
-          error: 'No PDF knowledge base uploaded. Please upload business documents.'
-        };
-      }
-      
-      console.log(`📚 Using RAG with ${knowledgeSummary.totalDocuments} PDF documents`);
-      
-      // Generate answer from PDF data (REQUIRED - no fallback to manual data)
-      const ragAnswer = await ragService.generateAnswerFromKnowledge(
-        userId,
-        incomingMessage,
-        contextData.contactName,
-        recentMessages
-      );
-      
-      if (ragAnswer.answer && ragAnswer.confidence > 0.15) {
-        console.log(`✅ RAG found relevant answer (confidence: ${ragAnswer.confidence})`);
-        
-        // Add assistant response to conversation history
-        (conversation as any).addMessage('assistant', ragAnswer.answer, aiAutoReply._id);
-        await conversation.save();
-        
-        // Log the auto-reply
-        await this.logAutoReply(
-          userId,
-          aiAutoReply._id.toString(),
-          contact?._id?.toString(),
-          incomingMessage,
-          'AI Generated from PDF',
-          ragAnswer.answer,
-          'ai_generated',
-          'success',
-          Date.now() - startTime
-        );
-        
-        // Update statistics
-        await this.updateAutoReplyStats(aiAutoReply._id.toString(), true);
-        
-        // Use RAG answer directly from PDFs
-        return {
-          shouldReply: true,
-          response: ragAnswer.answer,
-          autoReplyId: aiAutoReply._id.toString(),
-          confidence: ragAnswer.confidence,
-          processingTime: Date.now() - startTime
-        };
-      } else {
-        console.log(`⚠️ RAG confidence too low (${ragAnswer.confidence}) or no answer found`);
-        console.log(`💡 Suggestion: Upload more detailed business PDFs to improve answers`);
-        
-        return {
-          shouldReply: false,
-          error: 'No relevant information found in uploaded PDFs. Please upload more detailed business documents.'
-        };
-      }
-
-      // Removed: Old AI fallback without PDF data
-      // System now REQUIRES uploaded PDFs for AI auto-replies
-      
-      console.log(`✅ PDF RAG system is the ONLY source for AI auto-replies`);
-      return { shouldReply: false, error: 'PDF RAG did not find relevant answer' };
-
-    } catch (error) {
-      console.error('Error processing AI auto-reply:', error);
-      return {
-        shouldReply: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
-      };
-    }
+  private isAdultIntent(msg: string): boolean {
+    return ADULT_KEYWORDS.some(k => msg.toLowerCase().includes(k));
   }
 
-  private async getActiveAutoReplies(userId: string): Promise<any[]> {
-    const cacheKey = `autoReplies_${userId}`;
-    
-    // Check cache first
-    if (this.activeAutoReplies.has(cacheKey)) {
-      const expiry = this.cacheExpiry.get(cacheKey);
-      if (expiry && expiry > Date.now()) {
-        return this.activeAutoReplies.get(cacheKey) || [];
-      }
-    }
-
-    // Load from database
-    const autoReplies = await AutoReply.find({
-      userId,
-      isActive: true
-    }).sort({ priority: -1, createdAt: -1 });
-
-    // Cache the results
-    this.activeAutoReplies.set(cacheKey, autoReplies);
-    this.cacheExpiry.set(cacheKey, Date.now() + this.CACHE_TTL);
-
-    return autoReplies;
+  private isAbusive(msg: string): boolean {
+    return ABUSIVE_WORDS.some(w => msg.toLowerCase().includes(w));
   }
 
-  private async shouldTriggerAutoReply(
-    autoReply: any,
-    incomingMessage: string,
-    contextData: AutoReplyContext
-  ): Promise<boolean> {
-    try {
-      // Check time restrictions
-      if (autoReply.conditions?.timeRestrictions) {
-        const now = new Date();
-        const currentHour = now.getHours();
-        const currentDay = now.getDay();
+  private isTherapistQuery(msg: string): boolean { // FIXED: Compound check for precision
+    const lowerMsg = msg.toLowerCase();
+    const hasStaffTerm = ['therapist', 'masseuse', 'staff', 'employee'].some(k => lowerMsg.includes(k));
+    const hasQueryTerm = ['age', 'pic', 'photo', 'image', 'female', 'male'].some(k => lowerMsg.includes(k));
+    return hasStaffTerm && (hasQueryTerm || lowerMsg.includes('massage'));
+  }
 
-        const { startTime, endTime, daysOfWeek } = autoReply.conditions.timeRestrictions;
+  private isSpam(msg: string, ctx: any): boolean {
+    if (SPAM_PATTERNS.some(p => p.test(msg.trim()))) return true;
+    if (ctx.messageCount > 3 && msg.toLowerCase() === ctx.lastUserMessage?.toLowerCase()) return true;
+    return false;
+  }
 
-        // Check day of week
-        if (daysOfWeek && daysOfWeek.length > 0 && !daysOfWeek.includes(currentDay)) {
-          return false;
-        }
-
-        // Check time range
-        if (startTime && endTime) {
-          const [startHour, startMin] = startTime.split(':').map(Number);
-          const [endHour, endMin] = endTime.split(':').map(Number);
-          const currentMinutes = currentHour * 60 + now.getMinutes();
-          const startMinutes = startHour * 60 + startMin;
-          const endMinutes = endHour * 60 + endMin;
-
-          if (currentMinutes < startMinutes || currentMinutes > endMinutes) {
-            return false;
-          }
-        }
-      }
-
-      // Check contact filters
-      if (autoReply.conditions?.contactFilters) {
-        const { categories, tags, excludeContacts } = autoReply.conditions.contactFilters;
-
-        if (categories && categories.length > 0 && !categories.includes(contextData.contactCategory)) {
-          return false;
-        }
-
-        if (excludeContacts && excludeContacts.length > 0) {
-          // This would need contact ID, skip for now
-        }
-      }
-
-      // Check message filters
-      if (autoReply.conditions?.messageFilters) {
-        const { minLength, maxLength, containsAny, containsAll } = autoReply.conditions.messageFilters;
-
-        if (minLength && contextData.messageLength < minLength) {
-          return false;
-        }
-
-        if (maxLength && contextData.messageLength > maxLength) {
-          return false;
-        }
-
-        if (containsAll && containsAll.length > 0) {
-          const message = incomingMessage.toLowerCase();
-          const allPresent = containsAll.every(term => message.includes(term.toLowerCase()));
-          if (!allPresent) return false;
-        }
-
-        if (containsAny && containsAny.length > 0) {
-          const message = incomingMessage.toLowerCase();
-          const anyPresent = containsAny.some(term => message.includes(term.toLowerCase()));
-          if (!anyPresent) return false;
-        }
-      }
-
-      // Check trigger keywords
-      if (autoReply.triggerKeywords && autoReply.triggerKeywords.length > 0) {
-        const message = incomingMessage.toLowerCase();
-        const keywordMatch = autoReply.triggerKeywords.some(keyword => 
-          message.includes(keyword.toLowerCase())
-        );
-        if (!keywordMatch) return false;
-      }
-
-      // Check trigger patterns (regex)
-      if (autoReply.triggerPatterns && autoReply.triggerPatterns.length > 0) {
-        const patternMatch = autoReply.triggerPatterns.some(pattern => {
-          try {
-            const regex = new RegExp(pattern, 'i');
-            return regex.test(incomingMessage);
-          } catch (error) {
-            console.error('Invalid regex pattern:', pattern, error);
-            return false;
-          }
-        });
-        if (!patternMatch) return false;
-      }
-
-      return true;
-
-    } catch (error) {
-      console.error('Error checking auto-reply conditions:', error);
+  private async isMessageLimitReached(ctx: any): Promise<boolean> {
+    const today = new Date().toDateString();
+    if (!ctx.dailyMessageCount || ctx.lastMessageDate !== today) {
+      ctx.dailyMessageCount = 1;
+      ctx.lastMessageDate = today;
       return false;
     }
+    ctx.dailyMessageCount += 1;
+    return ctx.dailyMessageCount > 100;
   }
 
-  private async generateResponse(
-    autoReply: any,
-    incomingMessage: string,
-    contextData: AutoReplyContext
-  ): Promise<string | null> {
-    try {
-      switch (autoReply.responseType) {
-        case 'text':
-          return autoReply.responseTemplate;
+  private async generateResponse(userId: string, phone: string, message: string, state: any, spa: any): Promise<string> {
+    const ctx = state.context || {};
+    const history = await ConversationHistory.find({ userId, customerPhone: phone })
+      .sort({ timestamp: -1 })
+      .limit(10)
+      .select('message messageType')
+      .lean();
 
-        case 'template':
-          return this.processTemplate(autoReply.responseTemplate, contextData);
+    const conversation = history.reverse().map(h => `${h.messageType === 'incoming' ? 'Customer' : 'Kiara'}: ${h.message}`).join('\n');
 
-        case 'ai_generated':
-          if (autoReply.aiSettings?.useAI) {
-            const aiResult = await aiService.generateAutoReply(
-              incomingMessage,
-              contextData.contactName,
-              contextData,
-              autoReply.aiSettings.personality,
-              autoReply.aiSettings.includeGreeting,
-              autoReply.aiSettings.includeClosing
-            );
-            return aiResult.response;
-          }
-          return autoReply.responseTemplate;
+    const summary = ctx.customerName && ctx.selectedService ? 
+      `Stored Summary: Name: ${ctx.customerName}, Service: ${ctx.selectedService.name} (${ctx.selectedService.duration} min - ₹${ctx.selectedService.price}), Date/Time: ${ctx.preferredDate} ${ctx.preferredTime}` : 
+      'No full summary yet';
 
-        default:
-          return autoReply.responseTemplate;
-      }
-    } catch (error) {
-      console.error('Error generating response:', error);
-      return autoReply.responseTemplate; // Fallback to template
-    }
-  }
+    const prompt = `
+${this.ASSISTANT_PERSONA} Keep replies <100 words, punchy, 1-2 sentences + 1 question.
 
-  private processTemplate(template: string, contextData: AutoReplyContext): string {
-    let processed = template;
+SPA DETAILS:
+Name: ${spa.spaName}
+Location: ${spa.location}
+Admin Phone: ${spa.adminPhone}
+Map: ${spa.mapUrl}
+Discounts: ${spa.discounts}
+    Services: ${spa.services.map((s: any) => `${s.name}: ${s.description} (${s.variants}) | Benefits: ${s.benefits.join(', ')}`).join('; ')}
 
-    // Replace placeholders
-    processed = processed.replace(/\{contactName\}/g, contextData.contactName);
-    processed = processed.replace(/\{contactCategory\}/g, contextData.contactCategory || 'Customer');
-    processed = processed.replace(/\{messageTime\}/g, contextData.messageTime.toLocaleString());
-    processed = processed.replace(/\{previousMessages\}/g, contextData.previousMessages.toString());
+CUSTOMER CONTEXT:
+Name: ${ctx.customerName || 'Not shared'}
+Phone: ${ctx.customerPhone || phone}
+Service: ${ctx.selectedService?.name || 'Not selected'} (${ctx.selectedService?.variants || ''})
+Date: ${ctx.preferredDate || 'Not selected'}
+Time: ${ctx.preferredTime || 'Not selected'}
+Booking Status: ${ctx.bookingConfirmed ? 'Confirmed' : ctx.bookingCancelled ? 'Cancelled' : 'In Progress'}
+Daily Msgs: ${ctx.dailyMessageCount || 0}/100
+STORED SUMMARY: ${summary} (USE EXACT VALUES—do NOT re-ask for these)
 
-    return processed;
-  }
+CONVERSATION SO FAR:
+${conversation}
 
-  private async getPreviousMessageCount(userId: string, phoneNumber: string): Promise<number> {
-    try {
-      // This would need to be implemented based on your message history
-      // For now, return 0
-      return 0;
-    } catch (error) {
-      console.error('Error getting previous message count:', error);
-      return 0;
-    }
-  }
+LATEST MESSAGE: "${message}" (Detect language: Hindi/English/mixed)
 
-  private async logAutoReply(
-    userId: string,
-    autoReplyId: string,
-    contactId: string | undefined,
-    incomingMessage: string,
-    originalResponse: string,
-    finalResponse: string,
-    responseType: string,
-    status: string,
-    processingTime: number
-  ): Promise<void> {
-    try {
-      const log = new AutoReplyLog({
-        userId,
-        autoReplyId,
-        contactId,
-        incomingMessage,
-        originalResponse,
-        finalResponse,
-        responseType,
-        status,
-        processingTime,
-        contextData: {
-          messageLength: incomingMessage.length,
-          messageTime: new Date()
-        }
-      });
+INSTRUCTIONS:
+- Always personalize using STORED SUMMARY/CUSTOMER CONTEXT (e.g., "Rahul ji, aapka pehle bataya Swedish..."—never re-ask filled fields).
+- If user repeats data: Acknowledge briefly ("Haan, noted") but don't confirm unless change.
+- For incomplete: Ask ONLY missing (e.g., if no date: "Kab prefer?").
+- If first msg: Send welcome template with top 4 services, 20% off, spaadvisor.in link, ask for interest.
+- Service inquiry: Detect intent (any lang), show details + benefits, ask to book.
+- Booking interest: Ask date/time, mention discounts.
+- Date/time: Extract/store, ask name/phone if missing.
+- Name/phone: Extract/store, show summary, ask confirm ('yes'/'no').
+- Confirm: If yes/positive—confirm, notify admin. If no/negative—nudge with offer, notify admin.
+- Therapist: "We have female and professional therapists."
+- Be brief: Focus on key details/benefits, no fluff. End with ONE engaging question.
+- If limit reached: "Main manager se connect kar rahi hu..." and stop.
 
-      await log.save();
-    } catch (error) {
-      console.error('Error logging auto-reply:', error);
-    }
-  }
+REPLY (Hinglish,English, <60 words, persuasive):
+`.trim();
 
-  private async updateAutoReplyStats(autoReplyId: string, success: boolean): Promise<void> {
-    try {
-      const updateData: any = {
-        $inc: { 'statistics.totalTriggers': 1 },
-        $set: { 'statistics.lastTriggered': new Date() }
-      };
-
-      if (success) {
-        updateData.$inc['statistics.successfulReplies'] = 1;
-      } else {
-        updateData.$inc['statistics.failedReplies'] = 1;
-      }
-
-      await AutoReply.findByIdAndUpdate(autoReplyId, updateData);
-    } catch (error) {
-      console.error('Error updating auto-reply stats:', error);
-    }
-  }
-
-  async sendAutoReply(
-    userId: string,
-    phoneNumber: string,
-    response: string
-  ): Promise<{ success: boolean; messageId?: string; error?: string }> {
-    try {
-      const result = await whatsappService.sendMessage(userId, phoneNumber, response);
-      
-      if (result.success) {
-        console.log(`✅ Auto-reply sent successfully to ${phoneNumber}`);
-      } else {
-        console.error(`❌ Failed to send auto-reply to ${phoneNumber}:`, result.error);
-      }
-
-      return result;
-    } catch (error) {
-      console.error('Error sending auto-reply:', error);
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
-      };
-    }
-  }
-
-  // Removed: getReplyData and findBestReplyFromData methods
-  // System now ONLY uses uploaded PDFs via RAG service
-  // No manual data entry supported
-
-  // Clear cache for a specific user
-  clearUserCache(userId: string): void {
-    const keysToDelete = [];
-    for (const key of this.activeAutoReplies.keys()) {
-      if (key.startsWith(`autoReplies_${userId}`)) {
-        keysToDelete.push(key);
-      }
-    }
-
-    keysToDelete.forEach(key => {
-      this.activeAutoReplies.delete(key);
-      // Removed: replyDataCache
-      this.cacheExpiry.delete(key);
+    const response = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [{ role: "system", content: prompt }],
+      temperature: 0.9,
+      max_tokens: 200 // FIXED: Reduced for conciseness
     });
+
+    return response.choices[0]?.message?.content?.trim() || "Sorry, samajh nahi aaya. Dobara batayein?";
+  }
+
+  private async extractAndUpdateContext(message: string, ctx: any, spa: any) {
+    const extractPrompt = `
+Extract from message: "${message}" (Support Hindi/English).
+Return JSON only:
+{
+  "serviceIntent": "exact service name or null",
+  "duration": number or null,
+  "date": "Today/Tomorrow/Kal/etc or null",
+  "time": "5 PM/shaam 5 baje/etc or null",
+  "name": "string or null",
+  "phone": "string or null (10-digit)",
+  "confirmation": "yes/positive/confirm or no/negative/cancel or null",
+  "therapistQuery": true/false,
+  "changeIntent": true/false (if user says 'change', 'update', 'wrong', etc.)
+}
+`.trim();
+
+    try {
+      const res = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [{ role: "system", content: extractPrompt }],
+        response_format: { type: "json_object" },
+        temperature: 0
+      });
+      const data = JSON.parse(res.choices[0]?.message?.content || '{}');
+
+      const shouldUpdate = (field: string) => !ctx[field] || data.changeIntent;
+      if (data.name && shouldUpdate('customerName')) ctx.customerName = data.name;
+      if (data.phone && shouldUpdate('customerPhone')) ctx.customerPhone = data.phone;
+      if (data.date && shouldUpdate('preferredDate')) ctx.preferredDate = data.date;
+      if (data.time && shouldUpdate('preferredTime')) ctx.preferredTime = data.time;
+      if (data.serviceIntent && shouldUpdate('selectedService')) {
+        const svc = spa.services.find((s: any) => s.name.toLowerCase().includes(data.serviceIntent.toLowerCase()));
+        if (svc) {
+          const variant = data.duration ? svc.variants.find((v: any) => v.duration === data.duration) : svc.variants[0];
+          ctx.selectedService = { 
+            ...ctx.selectedService,
+            name: svc.name, 
+            description: svc.description, 
+            variants: svc.variants, 
+            benefits: svc.benefits, 
+            duration: variant.duration, 
+            price: variant.price 
+          };
+        }
+      }
+      if (data.confirmation === 'yes' || data.confirmation === 'positive') ctx.bookingConfirmed = true;
+      if (data.confirmation === 'no' || data.confirmation === 'negative') ctx.bookingCancelled = true;
+      if (data.therapistQuery) ctx.flags = { ...ctx.flags, therapistQuery: true };
+    } catch (e) { console.error('Extraction error:', e); }
+  }
+
+  private async sendAdminNotification(userId: string, type: 'booking' | 'cancel' | 'escalate', ctx: any, spa: any) {
+    const details = `
+${type.toUpperCase()} ALERT
+User: ${ctx.customerName || 'Unknown'}
+Phone: ${ctx.customerPhone || 'Unknown'}
+Spa: ${spa.spaName}, ${spa.location}
+Service: ${ctx.selectedService?.name || 'None'} (${ctx.selectedService?.duration} min - ₹${ctx.selectedService?.price})
+Date/Time: ${ctx.preferredDate} ${ctx.preferredTime}
+Map: ${spa.mapUrl}
+${type === 'escalate' ? 'Reason: Message limit reached (100+/day). Please follow up.' : ''}
+    `;
+    await whatsappService.sendMessageToAdmin(details);
+  }
+
+  private async scheduleReminder(ctx: any, userId: string, phone: string, spa: any) {
+    const bookingDate = new Date(ctx.preferredDate === 'Tomorrow' ? Date.now() + 86400000 : Date.now());
+    bookingDate.setHours(parseInt(ctx.preferredTime?.split(' ')[0]) || 17, 0, 0, 0);
+    const reminderTime = new Date(bookingDate.getTime() - 30 * 60000);
+    if (reminderTime > new Date()) {
+      setTimeout(async () => {
+        const reminder = `Reminder: Aapka ${ctx.selectedService.name} ${ctx.preferredDate} ${ctx.preferredTime} ke liye confirmed hai at ${spa.spaName}. 30 min bache hain! 😊`;
+        await this.send(userId, phone, reminder, 'reminder');
+      }, reminderTime.getTime() - Date.now());
+    }
+  }
+
+  async processMessage(userId: string, customerPhone: string, message: string): Promise<void> {
+    try {
+      const spaDoc = await SpaData.findOne({ userId });
+      if (!spaDoc || !spaDoc.autoReplySettings.isEnabled) return;
+
+      const spa = await this.getSpaContext(userId);
+
+      let state = await ConversationState.findOne({ userId, customerPhone });
+      if (!state) {
+        state = new ConversationState({ userId, customerPhone, currentStep: 'greeting', context: { dailyMessageCount: 0, lastMessageDate: new Date().toDateString() } });
+      }
+
+      const ctx: any = state.context;
+      ctx.messageCount = (ctx.messageCount || 0) + 1;
+      ctx.lastActivity = new Date();
+      ctx.lastUserMessage = message;
+
+      await this.saveHistory(userId, customerPhone, 'incoming', message, state.currentStep);
+
+      if (await this.isMessageLimitReached(ctx)) {
+        await this.send(userId, customerPhone, "Main aapko manager se connect kar rahi hu, thoda wait kijiye. Aapki madad manager karenge!", 'escalate');
+        await this.sendAdminNotification(userId, 'escalate', ctx, spa);
+        state.isActive = false;
+        await state.save();
+        return;
+      }
+
+      // FIXED: Extraction FIRST, before special checks
+      await this.extractAndUpdateContext(message, ctx, spaDoc);
+      await state.save();
+
+      if (this.isAdultIntent(message)) {
+        const reply = `Sir/Ma'am, hum sirf professional spa services dete hain. Privacy ke liye, ${spa.adminPhone} par call karein.`;
+        await this.send(userId, customerPhone, reply, 'adult_redirect');
+        await this.sendAdminNotification(userId, 'cancel', ctx, spa);
+        return;
+      }
+
+      if (this.isTherapistQuery(message)) {
+        const reply = `Humare paas experienced female aur professional therapists hain. Sab certified aur trained! Booking ke time choose kar sakte hain. Kya aur kuch jaanna hai?`;
+        await this.send(userId, customerPhone, reply, 'therapist_info');
+        return;
+      }
+
+      if (this.isAbusive(message)) {
+        ctx.abuseCount = (ctx.abuseCount || 0) + 1;
+        if (ctx.abuseCount >= 2) {
+          state.isActive = false;
+          await this.send(userId, customerPhone, `Sorry, respectful language please.`, 'blocked');
+        } else {
+          await this.send(userId, customerPhone, `Please respectful rahein. Kaise madad kar sakti hu?`, 'abuse_warning');
+        }
+        await state.save();
+        return;
+      }
+
+      if (this.isSpam(message, ctx)) {
+        ctx.spamCount = (ctx.spamCount || 0) + 1;
+        if (ctx.spamCount >= 5) {
+          state.isActive = false;
+          await state.save();
+          return;
+        }
+        if (ctx.spamCount === 3) {
+          await this.send(userId, customerPhone, `Main yahan spa booking ke liye hu. Service ya booking ke baare mein puchiye!`, 'spam_warning');
+        }
+        await state.save();
+        return;
+      }
+
+      const ready = ctx.customerName && ctx.customerPhone && ctx.selectedService?.duration && ctx.preferredDate && ctx.preferredTime && !ctx.bookingConfirmed && !ctx.bookingCancelled;
+
+      if (ready) {
+        if (ctx.bookingConfirmed) {
+          const confirmMsg = `Thank you ${ctx.customerName}! Aapki booking confirmed hai:\n\nUser: ${ctx.customerName} (${ctx.customerPhone})\nSpa: ${spa.spaName}, ${spa.location}\nService: ${ctx.selectedService.name} (${ctx.selectedService.duration} min - ₹${ctx.selectedService.price})\nDate/Time: ${ctx.preferredDate} ${ctx.preferredTime}\nMap: ${spa.mapUrl}\n\nCenter pe 10-15 min pehle pahunchiye. Kuch poochna ho to puchiye! 🌿`;
+          await this.send(userId, customerPhone, confirmMsg, 'confirmed');
+          await this.sendAdminNotification(userId, 'booking', ctx, spa);
+          await this.scheduleReminder(ctx, userId, customerPhone, spa);
+          await state.save();
+          return;
+        }
+
+        if (ctx.bookingCancelled) {
+          const cancelMsg = `Koi baat nahi ${ctx.customerName}! Humare paas amazing offers hain—center visit karke benefits le lijiye. 20% off first visit! Kab free hain aap?`;
+          await this.send(userId, customerPhone, cancelMsg, 'cancelled');
+          await this.sendAdminNotification(userId, 'cancel', ctx, spa);
+          await state.save();
+          return;
+        }
+
+        const summaryMsg = `Thank you ${ctx.customerName || 'Sir/Maam'}!\n\nAapke details:\nName: ${ctx.customerName || 'Please share'}\nPhone: ${ctx.customerPhone || customerPhone}\nSpa: ${spa.spaName}, ${spa.location}\nService: ${ctx.selectedService.name} (${ctx.selectedService.duration} min - ₹${ctx.selectedService.price})\nDate/Time: ${ctx.preferredDate} ${ctx.preferredTime}\nMap: ${spa.mapUrl}\n\nConfirm kar dein ('yes') ya change chahiye ('no')? Note: Center pe change kar sakte hain.`;
+        await this.send(userId, customerPhone, summaryMsg, 'summary');
+        await state.save();
+        return;
+      }
+
+      const reply = await this.generateResponse(userId, customerPhone, message, state, spa);
+      await this.send(userId, customerPhone, reply, 'ai_response');
+
+      state.context = ctx;
+      state.markModified('context');
+      await state.save();
+
+    } catch (error: any) {
+      console.error('AutoReply Error:', error);
+    }
   }
 }
 
-export default new AutoReplyService();
+export default new SmartSpaManager();

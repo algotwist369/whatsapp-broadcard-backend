@@ -5,7 +5,6 @@ import { Server as SocketIOServer } from 'socket.io';
 import QRCode from 'qrcode';
 import dotenv from 'dotenv';
 import autoReplyService from './autoReplyService';
-import messageRecoveryService from './messageRecoveryService';
 dotenv.config();
 
 interface WhatsAppConnection {
@@ -20,7 +19,7 @@ class WhatsAppService {
   private readonly sessionPath: string;
   private io: SocketIOServer | null = null;
   private connectionAttempts: Map<string, boolean> = new Map(); // Track connection attempts
-  private messageListenersSetup: Set<string> = new Set(); // Track users with message listeners
+  private messageListenersSetup: Map<string, boolean> = new Map(); // Track users with message listeners
   private isInitialized: boolean = false;
 
   constructor() {
@@ -35,11 +34,10 @@ class WhatsAppService {
   // Initialize service and restore existing connections
   async initialize() {
     if (this.isInitialized) return;
-    
+
     try {
       console.log('🔄 Initializing WhatsApp service and restoring connections...');
       await this.restoreExistingConnections();
-      await this.restoreAutoReplySettings();
       this.isInitialized = true;
       console.log('✅ WhatsApp service initialized successfully');
     } catch (error) {
@@ -51,12 +49,12 @@ class WhatsAppService {
   private async restoreExistingConnections() {
     try {
       // Import User model dynamically to avoid circular dependencies
-      const { default: User } = await import('../models/User');
-      
+      const User = (await import('../models/User.js')).default as any;
+
       // Find all users with active WhatsApp connections
-      const connectedUsers = await User.find({ 
+      const connectedUsers = await User.find({
         whatsappConnected: true,
-        isActive: true 
+        isActive: true
       }).select('_id whatsappSessionId');
 
       console.log(`📱 Found ${connectedUsers.length} users with WhatsApp connections to restore`);
@@ -64,7 +62,7 @@ class WhatsAppService {
       for (const user of connectedUsers) {
         const userId = user._id.toString();
         const sessionPath = path.join(this.sessionPath, `session-${userId}`);
-        
+
         // Check if session files exist
         if (fs.existsSync(sessionPath)) {
           console.log(`🔄 Restoring connection for user: ${userId}`);
@@ -85,41 +83,12 @@ class WhatsAppService {
     }
   }
 
-  // Restore auto-reply settings for connected users
-  private async restoreAutoReplySettings() {
-    try {
-      console.log('🔄 Restoring auto-reply settings...');
-      
-      // Get all users with active WhatsApp connections
-      const { default: User } = await import('../models/User');
-      const connectedUsers = await User.find({ 
-        whatsappConnected: true,
-        isActive: true 
-      }).select('_id');
-
-      console.log(`📱 Found ${connectedUsers.length} users with WhatsApp connections`);
-
-      for (const user of connectedUsers) {
-        const userId = user._id.toString();
-        const connection = this.connections.get(userId);
-        
-        if (connection && connection.isConnected) {
-          console.log(`🎧 Setting up auto-reply for user: ${userId}`);
-          this.setupMessageListener(connection.client, userId);
-        }
-      }
-
-      console.log('✅ Auto-reply settings restored');
-    } catch (error) {
-      console.error('❌ Error restoring auto-reply settings:', error);
-    }
-  }
 
   // Restore connection for a specific user (public method)
   async restoreUserConnection(userId: string): Promise<boolean> {
     try {
       const sessionPath = path.join(this.sessionPath, `session-${userId}`);
-      
+
       if (!fs.existsSync(sessionPath)) {
         return false;
       }
@@ -161,12 +130,19 @@ class WhatsAppService {
         console.log(`✅ WhatsApp connection restored for user: ${userId}`);
         connection.isConnected = true;
         connection.connectionState = 'open';
-        
+
         this.emitStatusUpdate(userId, {
           isConnected: true,
           state: 'open',
           qr: null
         });
+
+        // Ensure message listener is set up after restoration
+        try {
+          this.setupMessageListener(userId, client);
+        } catch (err) {
+          console.error('Failed to set up message listener after restoration:', err);
+        }
       });
 
       client.on('disconnected', (reason) => {
@@ -175,7 +151,7 @@ class WhatsAppService {
         connection.connectionState = 'disconnected';
         this.connections.delete(userId);
         this.messageListenersSetup.delete(userId);
-        
+
         this.emitStatusUpdate(userId, {
           isConnected: false,
           state: 'disconnected',
@@ -189,7 +165,7 @@ class WhatsAppService {
         connection.connectionState = 'auth_error';
         this.connections.delete(userId);
         this.messageListenersSetup.delete(userId);
-        
+
         this.emitStatusUpdate(userId, {
           isConnected: false,
           state: 'auth_error',
@@ -199,25 +175,25 @@ class WhatsAppService {
 
       // Initialize the client
       await client.initialize();
-      
+
       // Wait longer for connection to establish (WhatsApp can take 10-15 seconds)
       console.log(`⏳ Waiting for WhatsApp connection to establish for user: ${userId}...`);
-      
-      // Wait up to 20 seconds for connection
-      for (let i = 0; i < 20; i++) {
+
+      // Wait up to 30 seconds for connection
+      for (let i = 0; i < 30; i++) {
         await new Promise(resolve => setTimeout(resolve, 1000));
-        
+
         if (connection.isConnected && connection.connectionState === 'open') {
           console.log(`✅ Successfully restored WhatsApp connection for user: ${userId} after ${i + 1} seconds`);
           return true;
         }
-        
+
         // Log progress every 5 seconds
         if ((i + 1) % 5 === 0) {
           console.log(`⏳ Still waiting for connection... ${i + 1}s elapsed (state: ${connection.connectionState})`);
         }
       }
-      
+
       if (connection.isConnected) {
         console.log(`✅ WhatsApp connection restored for user: ${userId}`);
         return true;
@@ -268,7 +244,7 @@ class WhatsAppService {
           this.connectionAttempts.delete(userId);
           return { success: true, message: 'WhatsApp already connected' };
         }
-        
+
         // Try to auto-reconnect if session exists but not connected
         if (!connection.isConnected && connection.client) {
           console.log(`Attempting auto-reconnection for user ${userId}`);
@@ -276,7 +252,7 @@ class WhatsAppService {
             await connection.client.initialize();
             // Wait for connection to establish
             await new Promise(resolve => setTimeout(resolve, 5000));
-            
+
             if (connection.isConnected) {
               console.log(`Auto-reconnection successful for user ${userId}`);
               this.connectionAttempts.delete(userId);
@@ -288,7 +264,7 @@ class WhatsAppService {
             this.connections.delete(userId);
           }
         }
-        
+
         // If connection exists but not connected, check if it's still in connecting state
         if (connection.connectionState === 'connecting') {
           console.log('Connection already in progress, waiting for QR...');
@@ -299,7 +275,7 @@ class WhatsAppService {
             return { success: true, qr: connection.qr, message: 'QR code already available' };
           }
         }
-        
+
         // Clean up existing connection if not connected
         console.log('Cleaning up existing disconnected connection...');
         await this.disconnect(userId);
@@ -317,7 +293,7 @@ class WhatsAppService {
         }
       }
 
-      // Create WhatsApp client with LocalAuth and settings
+      // Create WhatsApp client with optimized settings for faster connection
       const client = new Client({
         authStrategy: new LocalAuth({
           clientId: `client-${userId}`,
@@ -335,7 +311,58 @@ class WhatsAppService {
             '--single-process',
             '--disable-gpu',
             '--disable-web-security',
-            '--disable-features=VizDisplayCompositor'
+            '--disable-features=VizDisplayCompositor',
+            '--disable-background-timer-throttling',
+            '--disable-backgrounding-occluded-windows',
+            '--disable-renderer-backgrounding',
+            '--disable-extensions',
+            '--disable-plugins',
+            '--disable-images',
+            '--disable-javascript',
+            '--disable-default-apps',
+            '--disable-sync',
+            '--disable-translate',
+            '--hide-scrollbars',
+            '--mute-audio',
+            '--no-default-browser-check',
+            '--no-pings',
+            '--password-store=basic',
+            '--use-mock-keychain',
+            '--disable-background-networking',
+            '--disable-component-extensions-with-background-pages',
+            '--disable-default-apps',
+            '--disable-extensions',
+            '--disable-sync',
+            '--disable-translate',
+            '--hide-scrollbars',
+            '--mute-audio',
+            '--no-default-browser-check',
+            '--no-first-run',
+            '--no-pings',
+            '--password-store=basic',
+            '--use-mock-keychain',
+            '--disable-blink-features=AutomationControlled',
+            '--disable-features=VizDisplayCompositor',
+            '--disable-ipc-flooding-protection',
+            '--disable-hang-monitor',
+            '--disable-prompt-on-repost',
+            '--disable-domain-reliability',
+            '--disable-client-side-phishing-detection',
+            '--disable-component-update',
+            '--disable-default-apps',
+            '--disable-dev-shm-usage',
+            '--disable-extensions',
+            '--disable-features=TranslateUI',
+            '--disable-ipc-flooding-protection',
+            '--disable-renderer-backgrounding',
+            '--disable-sync',
+            '--disable-web-security',
+            '--disable-features=VizDisplayCompositor',
+            '--no-default-browser-check',
+            '--no-first-run',
+            '--no-pings',
+            '--password-store=basic',
+            '--use-mock-keychain'
           ]
         }
       });
@@ -360,7 +387,7 @@ class WhatsAppService {
             state: 'timeout',
             qr: connection.qr
           });
-          
+
           // Also emit a follow-up update
           setTimeout(() => {
             console.log('📡 Sending follow-up timeout status update for user:', userId);
@@ -371,12 +398,12 @@ class WhatsAppService {
             });
           }, 100);
         }
-      }, 60000); // Reduced to 60 seconds timeout for faster feedback
+      }, 20000); // Reduced to 20 seconds timeout for faster feedback
 
       // Handle QR code generation
       client.on('qr', async (qr) => {
         console.log('QR code received for user:', userId);
-        
+
         try {
           // Convert QR string to base64 image format with optimized settings
           const qrImageData = await QRCode.toDataURL(qr, {
@@ -390,7 +417,7 @@ class WhatsAppService {
           });
           connection.qr = qrImageData;
           connection.isConnected = false;
-          
+
           // Emit real-time update immediately
           this.emitStatusUpdate(userId, {
             isConnected: false,
@@ -403,7 +430,7 @@ class WhatsAppService {
           const qrImageData = `data:image/png;base64,${qr}`;
           connection.qr = qrImageData;
           connection.isConnected = false;
-          
+
           this.emitStatusUpdate(userId, {
             isConnected: false,
             state: 'connecting',
@@ -420,11 +447,11 @@ class WhatsAppService {
         connection.connectionState = 'open';
         clearTimeout(connectionTimeout);
         this.connectionAttempts.delete(userId);
-        
+
         // Update database with connection status
         try {
-          const { default: User } = await import('../models/User');
-          await User.findByIdAndUpdate(userId, { 
+          const User = (await import('../models/User.js')).default as any;
+          await User.findByIdAndUpdate(userId, {
             whatsappConnected: true,
             whatsappSessionId: `session-${userId}`
           });
@@ -432,10 +459,8 @@ class WhatsAppService {
         } catch (error) {
           console.error(`❌ Failed to update database for user ${userId}:`, error);
         }
-        
-        // Set up message listener for auto-reply
-        this.setupMessageListener(client, userId);
-        
+
+
         // Emit real-time update IMMEDIATELY
         console.log('📡 Emitting WhatsApp connected status update for user:', userId);
         this.emitStatusUpdate(userId, {
@@ -443,7 +468,7 @@ class WhatsAppService {
           state: 'open',
           qr: null
         });
-        
+
         // Also emit a second update after a short delay to ensure it's received
         setTimeout(() => {
           console.log('📡 Sending follow-up status update for user:', userId);
@@ -453,42 +478,10 @@ class WhatsAppService {
             qr: null
           });
         }, 100);
-        
-        // 🔄 RECOVERY: Process any pending messages that were missed during disconnection
-        setTimeout(async () => {
-          try {
-            console.log(`🔍 Checking for pending messages for user ${userId}...`);
-            const needsRecovery = await messageRecoveryService.needsRecovery(userId);
-            
-            if (needsRecovery) {
-              console.log(`🔄 Starting message recovery for user ${userId}...`);
-              const recoveryResult = await messageRecoveryService.processPendingMessages(userId);
-              
-              console.log(`✅ Message recovery completed:`, {
-                total: recoveryResult.totalPending,
-                processed: recoveryResult.processed,
-                replied: recoveryResult.replied,
-                failed: recoveryResult.failed
-              });
-              
-              // Emit recovery completion status via WebSocket
-              if (this.io) {
-                this.io.to(`user-${userId}`).emit('message-recovery-complete', {
-                  success: true,
-                  totalPending: recoveryResult.totalPending,
-                  processed: recoveryResult.processed,
-                  replied: recoveryResult.replied,
-                  failed: recoveryResult.failed
-                });
-              }
-            } else {
-              console.log(`✅ No pending messages to recover for user ${userId}`);
-            }
-          } catch (recoveryError) {
-            console.error(`❌ Message recovery failed for user ${userId}:`, recoveryError);
-            // Don't fail the connection if recovery fails
-          }
-        }, 2000); // Wait 2 seconds after connection is established
+
+        // Set up message listener for auto-reply
+        this.setupMessageListener(userId, client);
+
       });
 
       // Handle authentication failure
@@ -501,11 +494,11 @@ class WhatsAppService {
         this.connectionAttempts.delete(userId);
         this.messageListenersSetup.delete(userId);
         clearTimeout(connectionTimeout);
-        
+
         // Update database with auth failure status
         try {
-          const { default: User } = await import('../models/User');
-          await User.findByIdAndUpdate(userId, { 
+          const User = (await import('../models/User.js')).default as any;
+          await User.findByIdAndUpdate(userId, {
             whatsappConnected: false,
             whatsappSessionId: null
           });
@@ -513,7 +506,7 @@ class WhatsAppService {
         } catch (error) {
           console.error(`❌ Failed to update database for user ${userId}:`, error);
         }
-        
+
         // Clean up session files on auth failure
         try {
           if (fs.existsSync(sessionPath)) {
@@ -522,7 +515,7 @@ class WhatsAppService {
         } catch (err) {
           console.error('Error cleaning up session:', err);
         }
-        
+
         // Emit auth failure status IMMEDIATELY
         console.log('📡 Emitting auth failure status update for user:', userId);
         this.emitStatusUpdate(userId, {
@@ -530,7 +523,7 @@ class WhatsAppService {
           state: 'auth_error',
           qr: null
         });
-        
+
         // Also emit a follow-up update
         setTimeout(() => {
           console.log('📡 Sending follow-up auth failure status update for user:', userId);
@@ -552,11 +545,11 @@ class WhatsAppService {
         this.connectionAttempts.delete(userId);
         this.messageListenersSetup.delete(userId);
         clearTimeout(connectionTimeout);
-        
+
         // Update database with disconnection status
         try {
-          const { default: User } = await import('../models/User');
-          await User.findByIdAndUpdate(userId, { 
+          const User = (await import('../models/User.js')).default as any;
+          await User.findByIdAndUpdate(userId, {
             whatsappConnected: false,
             whatsappSessionId: null
           });
@@ -564,7 +557,7 @@ class WhatsAppService {
         } catch (error) {
           console.error(`❌ Failed to update database for user ${userId}:`, error);
         }
-        
+
         // Emit disconnect status IMMEDIATELY
         console.log('📡 Emitting WhatsApp disconnected status update for user:', userId);
         this.emitStatusUpdate(userId, {
@@ -572,7 +565,7 @@ class WhatsAppService {
           state: 'disconnected',
           qr: null
         });
-        
+
         // Also emit a follow-up update to ensure it's received
         setTimeout(() => {
           console.log('📡 Sending follow-up disconnect status update for user:', userId);
@@ -587,59 +580,20 @@ class WhatsAppService {
       // Initialize the client
       await client.initialize();
 
-      // Wait for QR code generation with faster polling
-      let qrAttempts = 0;
-      const maxAttempts = 10; // Increased attempts for better coverage
-      const baseWaitTime = 100; // Reduced from 200ms to 100ms
+      // Return immediately for faster response - QR will be sent via WebSocket
+      this.connectionAttempts.delete(userId);
 
-      while (!connection.qr && qrAttempts < maxAttempts && connection.isConnected === false) {
-        const waitTime = baseWaitTime + (qrAttempts * 100); // Reduced increment from 200ms to 100ms
-        await new Promise(resolve => setTimeout(resolve, waitTime));
-        qrAttempts++;
-        console.log(`QR generation attempt ${qrAttempts}/${maxAttempts} - State: ${connection.connectionState}, Connected: ${connection.isConnected}, HasQR: ${!!connection.qr}`);
+      // Emit initial status immediately
+      this.emitStatusUpdate(userId, {
+        isConnected: false,
+        state: 'connecting',
+        qr: null
+      });
 
-        // Check if connection is still valid
-        if (connection.connectionState === 'disconnected') {
-          console.log('Connection closed during QR generation, stopping attempts');
-          break;
-        }
-
-        // Check if connection state changed to open (connected)
-        if (connection.connectionState === 'open' || connection.isConnected) {
-          console.log('Connection established during QR generation');
-          break;
-        }
-
-        // Check if we got a QR code
-        if (connection.qr) {
-          console.log('QR code generated successfully');
-          break;
-        }
-      }
-
-      if (connection.qr) {
-        console.log('QR code generated successfully and ready');
-        this.connectionAttempts.delete(userId);
-        return {
-          success: true,
-          qr: connection.qr,
-          message: 'QR code generated. Please scan to connect.'
-        };
-      } else if (connection.isConnected) {
-        console.log('Connection established without QR code');
-        this.connectionAttempts.delete(userId);
-        return {
-          success: true,
-          message: 'WhatsApp connected successfully.'
-        };
-      } else {
-        console.log('QR code not generated within timeout, but connection may still be establishing');
-        this.connectionAttempts.delete(userId);
-        return {
-          success: true,
-          message: 'Connection in progress. QR code may appear shortly.'
-        };
-      }
+      return {
+        success: true,
+        message: 'Connection initiated. QR code will appear shortly via WebSocket.'
+      };
 
     } catch (error) {
       console.error('Error creating WhatsApp connection:', error);
@@ -651,6 +605,83 @@ class WhatsAppService {
     }
   }
 
+  /**
+   * Send an interactive message with buttons
+   */
+  async sendInteractiveMessage(userId: string, phoneNumber: string, message: string, menu: any): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    try {
+      const connection = this.connections.get(userId);
+      if (!connection || !connection.client) {
+        console.log(`❌ WhatsApp client not connected for user ${userId}`);
+        return { success: false, error: 'WhatsApp client not connected' };
+      }
+
+      const client = connection.client;
+
+      // Check if client is ready - use connection state instead of client.info
+      if (!connection.isConnected || connection.connectionState !== 'open') {
+        console.log(`❌ WhatsApp client not ready for user ${userId}, state: ${connection.connectionState}`);
+        return { success: false, error: 'WhatsApp client not ready' };
+      }
+
+      // Format message with clickable buttons
+      let buttonText = message;
+
+      if (menu && menu.buttons && menu.buttons.length > 0) {
+        buttonText += '\n\n📱 **Clickable Options:**\n';
+        menu.buttons.forEach((button: any, index: number) => {
+          buttonText += `🔘 ${button.title}`;
+          if (button.description) {
+            buttonText += ` (${button.description})`;
+          }
+          buttonText += '\n';
+        });
+      }
+
+      if (menu && menu.footer) {
+        buttonText += `\n\n${menu.footer}`;
+      }
+
+      // Add instructions for clicking buttons
+      buttonText += '\n\n💡 *Tap any option above to continue!*';
+
+      console.log(`📤 Sending interactive message to ${phoneNumber}: ${buttonText.substring(0, 100)}...`);
+
+      // Use regular sendMessage with better error handling
+      const result = await this.sendMessage(userId, phoneNumber, buttonText);
+
+      if (result.success) {
+        console.log(`✅ Interactive message sent successfully to ${phoneNumber}`);
+        return {
+          success: true,
+          messageId: result.messageId
+        };
+      } else {
+        console.log(`❌ Failed to send interactive message to ${phoneNumber}: ${result.error}`);
+        return {
+          success: false,
+          error: result.error || 'Failed to send message'
+        };
+      }
+
+    } catch (error) {
+      console.error(`❌ Error in sendInteractiveMessage to ${phoneNumber}:`, error);
+
+      // Fallback to regular message
+      try {
+        console.log(`🔄 Attempting fallback to regular message for ${phoneNumber}`);
+        const fallbackResult = await this.sendMessage(userId, phoneNumber, message);
+        return fallbackResult;
+      } catch (fallbackError) {
+        console.error(`❌ Fallback also failed for ${phoneNumber}:`, fallbackError);
+        return {
+          success: false,
+          error: `Interactive message failed: ${error instanceof Error ? error.message : 'Unknown error'}`
+        };
+      }
+    }
+  }
+
   async sendMessage(
     userId: string,
     phoneNumber: string,
@@ -658,7 +689,7 @@ class WhatsAppService {
   ): Promise<{ success: boolean; messageId?: string; error?: string }> {
     try {
       console.log(`Attempting to send message for user ${userId} to ${phoneNumber}`);
-      
+
       const connection = this.connections.get(userId);
 
       if (!connection || !connection.isConnected) {
@@ -669,9 +700,17 @@ class WhatsAppService {
         };
       }
 
+      const client = connection.client;
+
+      // Check if client is ready - use connection state instead of client.info
+      if (!connection.isConnected || connection.connectionState !== 'open') {
+        console.log(`❌ WhatsApp client not ready for user ${userId}, state: ${connection.connectionState}`);
+        return { success: false, error: 'WhatsApp client not ready' };
+      }
+
       // Format phone number for India (+91)
       let formattedNumber = phoneNumber.replace(/\D/g, '');
-      
+
       // Handle India phone numbers specifically
       if (formattedNumber.startsWith('91')) {
         // Already has country code
@@ -686,9 +725,9 @@ class WhatsAppService {
         // International number, keep as is
         formattedNumber = formattedNumber;
       }
-      
+
       const chatId = `${formattedNumber}@c.us`;
-      
+
       console.log(`Sending message to chatId: ${chatId} (Original: ${phoneNumber})`);
 
       // Validate Indian phone number format
@@ -699,20 +738,48 @@ class WhatsAppService {
         };
       }
 
-      // Send message using whatsapp-web.js
-      const sent = await connection.client.sendMessage(chatId, message);
-      
-      console.log(`Message sent successfully:`, sent);
+      // Send message using whatsapp-web.js with better error handling
+      console.log(`📤 Attempting to send message to ${chatId}`);
 
-      if (sent) {
+      try {
+        const sent = await connection.client.sendMessage(chatId, message);
+
+        console.log(`✅ Message sent successfully to ${chatId}`);
+        console.log(`📱 Message ID: ${sent.id?._serialized || sent.id || 'unknown'}`);
+
         return {
           success: true,
           messageId: typeof sent.id === 'string' ? sent.id : sent.id?._serialized || 'unknown'
         };
-      } else {
+      } catch (sendError) {
+        console.error(`❌ Error sending message to ${chatId}:`, sendError);
+
+        // Check if it's a specific evaluation error
+        if (sendError instanceof Error && sendError.message.includes('Evaluation failed')) {
+          console.log(`🔄 Evaluation error detected, trying alternative approach...`);
+
+          // Try sending with a simpler message first
+          try {
+            const simpleMessage = message.length > 100 ? message.substring(0, 100) + '...' : message;
+            const sent = await connection.client.sendMessage(chatId, simpleMessage);
+
+            console.log(`✅ Fallback message sent successfully to ${chatId}`);
+            return {
+              success: true,
+              messageId: (sent.id?._serialized || sent.id) as string || 'unknown'
+            };
+          } catch (fallbackError) {
+            console.error(`❌ Fallback also failed:`, fallbackError);
+            return {
+              success: false,
+              error: `Message sending failed: ${fallbackError instanceof Error ? fallbackError.message : 'Unknown error'}`
+            };
+          }
+        }
+
         return {
           success: false,
-          error: 'Failed to send message'
+          error: `Message sending failed: ${sendError instanceof Error ? sendError.message : 'Unknown error'}`
         };
       }
 
@@ -722,6 +789,53 @@ class WhatsAppService {
         success: false,
         error: error instanceof Error ? error.message : 'Unknown error'
       };
+    }
+  }
+
+  /**
+   * Indicate chat state (typing/paused/recording) to a specific chat
+   */
+  async sendChatState(
+    userId: string,
+    phoneNumber: string,
+    state: 'typing' | 'paused' | 'recording' = 'typing'
+  ): Promise<boolean> {
+    try {
+      const connection = this.connections.get(userId);
+      if (!connection || !connection.isConnected || connection.connectionState !== 'open') {
+        return false;
+      }
+
+      // Format phone number similar to sendMessage
+      let formattedNumber = phoneNumber.replace(/\D/g, '');
+      if (formattedNumber.startsWith('91')) {
+        formattedNumber = formattedNumber;
+      } else if (formattedNumber.startsWith('0')) {
+        formattedNumber = '91' + formattedNumber.substring(1);
+      } else if (formattedNumber.length === 10) {
+        formattedNumber = '91' + formattedNumber;
+      }
+      const chatId = `${formattedNumber}@c.us`;
+
+      const chat: any = await connection.client.getChatById(chatId);
+      if (!chat) return false;
+
+      if (state === 'typing' && typeof chat.sendStateTyping === 'function') {
+        await chat.sendStateTyping();
+        return true;
+      }
+      if (state === 'recording' && typeof chat.sendStateRecording === 'function') {
+        await chat.sendStateRecording();
+        return true;
+      }
+      if (typeof chat.sendStatePaused === 'function') {
+        await chat.sendStatePaused();
+        return true;
+      }
+
+      return false;
+    } catch (error) {
+      return false;
     }
   }
 
@@ -785,10 +899,44 @@ class WhatsAppService {
     return results;
   }
 
+  /**
+   * Send an admin notification using the first available active connection.
+   * Admin phone must be set in ENV as ADMIN_PHONE (e.g., +9198XXXXXXXX or 98XXXXXXXX).
+   */
+  async sendMessageToAdmin(message: string): Promise<{ success: boolean; error?: string }> {
+    try {
+      const adminPhone = (process.env.ADMIN_PHONE || '+91 7388480128').trim();
+      if (!adminPhone) {
+        console.warn('ADMIN_PHONE not configured; cannot send admin notification');
+        return { success: false, error: 'ADMIN_PHONE not set' };
+      }
+  
+      for (const [userId, connection] of this.connections.entries()) {
+        if (connection.isConnected && connection.connectionState === 'open') {
+          const result = await this.sendMessage(userId, adminPhone, message.replace(/\n/g, '\n'));
+          return { success: result.success, error: result.error };
+        }
+      }
+  
+      return { success: false, error: 'No active WhatsApp connections available' };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  
   getConnectionStatus(userId: string): { isConnected: boolean; state: string } {
     const connection = this.connections.get(userId);
 
     if (!connection) {
+      // If no active connection but session files exist, start restoration
+      if (this.hasExistingSession(userId)) {
+        // Kick off restoration asynchronously; don't await to keep response fast
+        this.restoreUserConnection(userId).catch(err => {
+          console.error(`Auto-restore failed for user ${userId}:`, err);
+        });
+        return { isConnected: false, state: 'restoring' };
+      }
       return { isConnected: false, state: 'not_connected' };
     }
 
@@ -825,7 +973,7 @@ class WhatsAppService {
   isConnected(userId: string): boolean {
     const connection = this.connections.get(userId);
     if (!connection) return false;
-    
+
     return connection.isConnected;
   }
 
@@ -898,7 +1046,7 @@ class WhatsAppService {
     if (!connection) {
       return { exists: false };
     }
-    
+
     return {
       exists: true,
       isConnected: connection.isConnected,
@@ -908,121 +1056,51 @@ class WhatsAppService {
     };
   }
 
-  // Set up message listener for auto-reply functionality
-  private setupMessageListener(client: Client, userId: string): void {
-    // Skip if listener already set up for this user
+  // Set up message listener for auto-reply
+  private setupMessageListener(userId: string, client: Client): void {
+    // Check if listener is already set up to avoid duplicates
     if (this.messageListenersSetup.has(userId)) {
-      console.log(`⏭️ Message listener already set up for user: ${userId}`);
+      console.log(`Message listener already set up for user ${userId}`);
       return;
     }
-    
-    console.log(`🎧 Setting up message listener for user: ${userId}`);
-    this.messageListenersSetup.add(userId);
-    
-    client.on('message', async (message: Message) => {
+
+    console.log(`Setting up message listener for auto-reply for user ${userId}`);
+
+    client.on('message', async (message: any) => {
       try {
-        const msg = message as any; // Type assertion for incomplete whatsapp-web.js types
-        
         // Only process incoming messages (not outgoing)
-        if (msg.fromMe) {
+        if (message.fromMe) {
           return;
         }
 
-        // Only process text messages for now
-        if (msg.type !== 'chat') {
+        // Skip group messages and status broadcasts
+        if (typeof message.from === 'string' && message.from.endsWith('@g.us')) {
+          return;
+        }
+        if (typeof message.from === 'string' && message.from === 'status@broadcast') {
           return;
         }
 
-        const phoneNumber = msg.from.replace('@c.us', '');
-        const messageText = msg.body;
-        const messageId = msg.id?._serialized || msg.id?.id;
-        
-        console.log(`📨 Incoming message from ${phoneNumber}: ${messageText.substring(0, 50)}...`);
-
-        try {
-          // Process auto-reply (checks are done internally)
-          const autoReplyResult = await autoReplyService.processIncomingMessage(
-            userId,
-            phoneNumber,
-            messageText
-          );
-
-          if (autoReplyResult.shouldReply && autoReplyResult.response) {
-            console.log(`🤖 Auto-reply triggered for ${phoneNumber}`);
-            
-            // Send the auto-reply
-            const sendResult = await autoReplyService.sendAutoReply(
-              userId,
-              phoneNumber,
-              autoReplyResult.response
-            );
-
-            if (sendResult.success) {
-              console.log(`✅ Auto-reply sent successfully to ${phoneNumber}`);
-            } else {
-              console.error(`❌ Failed to send auto-reply to ${phoneNumber}:`, sendResult.error);
-              
-              // 💾 RECOVERY: Save message as pending if auto-reply failed
-              console.log(`💾 Saving message as pending for later recovery`);
-              await messageRecoveryService.savePendingMessage(
-                userId,
-                phoneNumber,
-                messageText,
-                messageId
-              );
-            }
-          } else {
-            console.log(`⏭️ No auto-reply triggered for ${phoneNumber}`);
-          }
-
-        } catch (autoReplyError) {
-          console.error(`❌ Auto-reply processing failed for ${phoneNumber}:`, autoReplyError);
-          
-          // 💾 RECOVERY: Save message as pending if processing failed
-          console.log(`💾 Saving message as pending due to processing error`);
-          await messageRecoveryService.savePendingMessage(
-            userId,
-            phoneNumber,
-            messageText,
-            messageId
-          );
+        // Process if there's textual content
+        const messageBody = (message.body || '').toString().trim();
+        if (!messageBody) {
+          return;
         }
+        const fromNumber = message.from.replace('@c.us', '');
+
+        console.log(`📨 Incoming message from ${fromNumber}: ${messageBody.substring(0, 50)}...`);
+
+        // Process auto-reply
+        await autoReplyService.processMessage(userId, fromNumber, messageBody);
 
       } catch (error) {
-        console.error('Error in message listener:', error);
-        // Even if something goes wrong, try to save the message if possible
-        try {
-          const msg = message as any;
-          if (msg && !msg.fromMe && msg.type === 'chat') {
-            const phoneNumber = msg.from.replace('@c.us', '');
-            const messageText = msg.body;
-            const messageId = msg.id?._serialized || msg.id?.id;
-            
-            console.log(`💾 Saving message as pending due to listener error`);
-            await messageRecoveryService.savePendingMessage(
-              userId,
-              phoneNumber,
-              messageText,
-              messageId
-            );
-          }
-        } catch (saveError) {
-          console.error('Failed to save message as pending:', saveError);
-        }
+        console.error('Error processing incoming message for auto-reply:', error);
       }
     });
-    
-    console.log(`✅ Message listener set up for user: ${userId}`);
-  }
 
-  // Manually trigger auto-reply processing (for testing)
-  async triggerAutoReply(userId: string, phoneNumber: string, message: string): Promise<any> {
-    try {
-      return await autoReplyService.processIncomingMessage(userId, phoneNumber, message);
-    } catch (error) {
-      console.error('Error triggering auto-reply:', error);
-      return { shouldReply: false, error: error instanceof Error ? error.message : 'Unknown error' };
-    }
+    // Mark listener as set up
+    this.messageListenersSetup.set(userId, true);
+    console.log(`✅ Message listener set up for auto-reply for user ${userId}`);
   }
 }
 

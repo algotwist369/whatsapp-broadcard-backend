@@ -2,104 +2,62 @@ import mongoose, { Document, Schema } from 'mongoose';
 
 export interface IConversationHistory extends Document {
   userId: mongoose.Types.ObjectId;
-  phoneNumber: string;
-  contactId?: mongoose.Types.ObjectId;
-  messages: Array<{
-    role: 'user' | 'assistant';
-    content: string;
-    timestamp: Date;
-    autoReplyId?: mongoose.Types.ObjectId;
-  }>;
-  lastMessageAt: Date;
-  messageCount: number;
-  isActive: boolean;
-  createdAt: Date;
-  updatedAt: Date;
+  customerPhone: string;
+  messageType: 'incoming' | 'outgoing';
+  message: string;
+  aiResponse?: string;
+  step: string;
+  context: any;
+  timestamp: Date;
+  isProcessed: boolean;
 }
 
 const ConversationHistorySchema = new Schema<IConversationHistory>({
   userId: {
     type: Schema.Types.ObjectId,
     ref: 'User',
-    required: [true, 'User ID is required'],
-    index: true
+    required: true
   },
-  phoneNumber: {
+  customerPhone: {
     type: String,
-    required: [true, 'Phone number is required'],
-    index: true
+    required: true,
+    trim: true
   },
-  contactId: {
-    type: Schema.Types.ObjectId,
-    ref: 'Contact'
+  messageType: {
+    type: String,
+    required: true,
+    enum: ['incoming', 'outgoing']
   },
-  messages: [{
-    role: {
-      type: String,
-      enum: ['user', 'assistant'],
-      required: true
-    },
-    content: {
-      type: String,
-      required: true,
-      maxlength: [2000, 'Message content cannot exceed 2000 characters']
-    },
-    timestamp: {
-      type: Date,
-      default: Date.now
-    },
-    autoReplyId: {
-      type: Schema.Types.ObjectId,
-      ref: 'AutoReply'
-    }
-  }],
-  lastMessageAt: {
+  message: {
+    type: String,
+    required: true,
+    trim: true
+  },
+  aiResponse: {
+    type: String,
+    trim: true
+  },
+  step: {
+    type: String,
+    required: true
+  },
+  context: {
+    type: Schema.Types.Mixed,
+    default: {}
+  },
+  timestamp: {
     type: Date,
-    default: Date.now,
-    index: true
+    default: Date.now
   },
-  messageCount: {
-    type: Number,
-    default: 0
-  },
-  isActive: {
+  isProcessed: {
     type: Boolean,
-    default: true,
-    index: true
+    default: false
   }
 }, {
   timestamps: true
 });
 
-// Compound indexes for efficient querying
-ConversationHistorySchema.index({ userId: 1, phoneNumber: 1 });
-ConversationHistorySchema.index({ userId: 1, lastMessageAt: -1 });
-
-// TTL index to automatically delete old conversations after 30 days of inactivity
-ConversationHistorySchema.index({ lastMessageAt: 1 }, { expireAfterSeconds: 30 * 24 * 60 * 60 });
-
-// Method to add a message to conversation
-ConversationHistorySchema.methods.addMessage = function(role: 'user' | 'assistant', content: string, autoReplyId?: mongoose.Types.ObjectId) {
-  // Keep only last 10 messages for context (to prevent too much data)
-  if (this.messages.length >= 10) {
-    this.messages = this.messages.slice(-9); // Keep last 9, will add 1 more
-  }
-  
-  this.messages.push({
-    role,
-    content,
-    timestamp: new Date(),
-    autoReplyId
-  });
-  
-  this.lastMessageAt = new Date();
-  this.messageCount += 1;
-};
-
-// Method to get recent messages for context
-ConversationHistorySchema.methods.getRecentMessages = function(limit: number = 5) {
-  return this.messages.slice(-limit);
-};
+ConversationHistorySchema.index({ userId: 1, customerPhone: 1, timestamp: -1 });
+ConversationHistorySchema.index({ isProcessed: 1, timestamp: -1 });
 
 export default mongoose.model<IConversationHistory>('ConversationHistory', ConversationHistorySchema);
-

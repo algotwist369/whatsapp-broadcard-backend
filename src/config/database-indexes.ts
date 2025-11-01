@@ -3,9 +3,19 @@ import mongoose from 'mongoose';
 // Database indexing for performance optimization
 export const createIndexes = async () => {
   try {
+    // Skip if MongoDB is not connected yet
+    if (!mongoose.connection || mongoose.connection.readyState !== 1 || !mongoose.connection.db) {
+      console.log('⏭️  Skipping index creation: MongoDB not connected');
+      return;
+    }
+
     // Helper function to create index with error handling
     const createIndexSafely = async (collection: any, indexSpec: any, options: any = {}) => {
       try {
+        if (!collection) {
+          console.log(`⏭️  Skipping index on missing collection: ${JSON.stringify(indexSpec)}`);
+          return;
+        }
         await collection.createIndex(indexSpec, options);
         console.log(`✅ Index created: ${JSON.stringify(indexSpec)}`);
       } catch (error: any) {

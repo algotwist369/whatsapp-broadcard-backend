@@ -5,7 +5,7 @@ import compression from 'compression';
 import morgan from 'morgan';
 import rateLimit from 'express-rate-limit';
 import { performanceMiddleware, errorHandler, cacheMiddleware, rateLimitMiddleware, getPerformanceMetrics } from './middleware/performance';
-import dotenv from 'dotenv';
+import env from './config/env';
 import { createServer } from 'http';
 import { Server as SocketIOServer } from 'socket.io';
 
@@ -29,12 +29,11 @@ import messagesRoutes from './routes/messages';
 import performanceRoutes from './routes/performance';
 import settingsRoutes from './routes/settings';
 import autoReplyRoutes from './routes/autoReply';
-import messageRecoveryRoutes from './routes/messageRecovery';
-import autoReplyTestRoutes from './routes/autoReplyTest';
-import knowledgeBaseRoutes from './routes/knowledgeBase';
 
-// Load environment variables
-dotenv.config();
+// Import services
+// import whatsappService from './services/whatsappService'; // Moved to require below
+
+// Environment loaded via env config
 
 const app = express();
 const server = createServer(app);
@@ -42,7 +41,7 @@ const server = createServer(app);
 // Socket.IO for real-time updates
 const io = new SocketIOServer(server, {
   cors: {
-    origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+    origin: env.FRONTEND_URL || 'http://localhost:3000',
     methods: ['GET', 'POST'],
     credentials: true
   },
@@ -98,17 +97,19 @@ const authLimiterLegacy = rateLimit({
   legacyHeaders: false,
 });
 
+// CORS configuration - MUST be before rate limiting
+app.use(cors({
+  origin: env.FRONTEND_URL || 'http://localhost:3000',
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  preflightContinue: false,
+  optionsSuccessStatus: 204
+}));
+
 // Apply different rate limits to different route groups
 app.use('/api/auth', authLimiter);
 app.use('/api/', generalLimiter);
-
-// CORS configuration
-app.use(cors({
-  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
-}));
 
 // Body parsing middleware
 app.use(express.json({ limit: '10mb' }));
@@ -157,6 +158,57 @@ app.get('/health', (req, res) => {
   });
 });
 
+// Debug endpoint for WhatsApp status (no auth required)
+app.get('/debug/whatsapp-status', async (req, res) => {
+  if (process.env.NODE_ENV === 'production') {
+    return res.status(404).json({ success: false, message: 'Not found' });
+  }
+  try {
+    const whatsappService = require('./services/whatsappService').default;
+    const User = require('./models/User').default;
+    
+    // Get all users
+    const users = await User.find().select('_id email whatsappConnected whatsappSessionId');
+    
+    // Get WhatsApp service status
+    const serviceStatus = {
+      totalUsers: users.length,
+      connectedUsers: users.filter(u => u.whatsappConnected).length,
+      users: users.map(u => ({
+        id: u._id,
+        email: u.email,
+        whatsappConnected: u.whatsappConnected,
+        sessionId: u.whatsappSessionId
+      }))
+    };
+    
+    res.json({
+      success: true,
+      message: 'WhatsApp debug status',
+      data: serviceStatus,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error: any) {
+    res.status(500).json({
+      success: false,
+      message: 'Debug error',
+      error: error.message
+    });
+  }
+});
+
+// Health check endpoint
+app.get('/api/health', (req, res) => {
+  res.json({
+    success: true,
+    message: 'Backend is running',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    memory: process.memoryUsage(),
+    version: process.env.npm_package_version || '1.0.0'
+  });
+});
+
 // API routes
 app.use('/api/auth', authLimiter, authRoutes);
 app.use('/api/whatsapp', apiLimiter, whatsappRoutes);
@@ -165,9 +217,7 @@ app.use('/api/messages', apiLimiter, messagesRoutes);
 app.use('/api/performance', performanceRoutes);
 app.use('/api/settings', apiLimiter, settingsRoutes);
 app.use('/api/auto-reply', apiLimiter, autoReplyRoutes);
-app.use('/api/recovery', apiLimiter, messageRecoveryRoutes);
-app.use('/api/auto-reply-test', apiLimiter, autoReplyTestRoutes);
-app.use('/api/knowledge-base', apiLimiter, knowledgeBaseRoutes);
+
 
 // Socket.IO authentication middleware
 io.use(async (socket, next) => {
@@ -180,7 +230,7 @@ io.use(async (socket, next) => {
     }
 
     const jwt = require('jsonwebtoken');
-    const decoded = jwt.verify(token, process.env.JWT_SECRET!) as { userId: string };
+    const decoded = jwt.verify(token, env.JWT_SECRET) as { userId: string };
     
     const User = require('./models/User').default;
     const user = await User.findById(decoded.userId).select('-password');
@@ -269,11 +319,11 @@ io.on('connection', (socket: any) => {
 app.set('io', io);
 
 // Initialize WhatsApp service with Socket.IO
-import whatsappService from './services/whatsappService';
+const whatsappService = require('./services/whatsappService').default;
 whatsappService.setSocketIO(io);
 
 // Global error handler
-app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+app.use((err: any, req: express.Request, res: express.Response, _next: express.NextFunction) => {
   console.error('Global error handler:', err);
 
   // Mongoose validation error
@@ -383,10 +433,7 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 // Initialize WhatsApp service after database connection
 const initializeServices = async () => {
   try {
-    // Import WhatsApp service
-    const whatsappService = (await import('./services/whatsappService')).default;
-    
-    // Set Socket.IO instance
+    // Set Socket.IO instance for services
     whatsappService.setSocketIO(io);
     
     // Initialize WhatsApp service to restore connections
@@ -402,7 +449,7 @@ const initializeServices = async () => {
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, async () => {
   console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📱 Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`📱 Environment: ${env.NODE_ENV}`);
   console.log(`🔗 Health check: http://localhost:${PORT}/health`);
   
   // Initialize services after server starts

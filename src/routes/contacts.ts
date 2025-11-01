@@ -1,10 +1,9 @@
 import { Router, Request, Response } from 'express';
 import { authenticate } from '../middleware/auth';
-import { validate, contactSchema } from '../middleware/validation';
 import Contact from '../models/Contact';
 import multer from 'multer';
 import XLSX from 'xlsx';
-import { cache, invalidateCache } from '../middleware/cache';
+import { invalidateCache } from '../middleware/cache';
 import mongoose from 'mongoose';
 
 const router = Router();
@@ -171,10 +170,8 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
   }
 });
 
-// @route   POST /api/contacts
-// @desc    Add a new contact
-// @access  Private
-router.post('/', authenticate, validate(contactSchema), invalidateCache(['cache:/api/contacts*']), async (req: Request, res: Response) => {
+ 
+router.post('/', authenticate, invalidateCache(['cache:/api/contacts*']), async (req: Request, res: Response) => {
   try {
     const user = req.user!;
     const { name, phone, email } = req.body;
@@ -252,7 +249,7 @@ router.post('/', authenticate, validate(contactSchema), invalidateCache(['cache:
 // @route   PUT /api/contacts/:id
 // @desc    Update a contact
 // @access  Private
-router.put('/:id', authenticate, validate(contactSchema), async (req: Request, res: Response) => {
+router.put('/:id', authenticate, async (req: Request, res: Response) => {
   try {
     const user = req.user!;
     const { id } = req.params;

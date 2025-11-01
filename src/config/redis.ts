@@ -1,9 +1,10 @@
 import Redis from 'ioredis';
+import env from './env';
 
 const redis = new Redis({
-  host: process.env.REDIS_HOST || 'localhost',
-  port: parseInt(process.env.REDIS_PORT || '6379'),
-  password: process.env.REDIS_PASSWORD,
+  host: env.REDIS_HOST || 'localhost',
+  port: parseInt(env.REDIS_PORT || '6379'),
+  password: env.REDIS_PASSWORD,
   enableReadyCheck: false,
   maxRetriesPerRequest: 3,
   // Performance optimizations

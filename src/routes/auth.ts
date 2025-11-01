@@ -1,16 +1,29 @@
 import { Router, Request, Response } from 'express';
 import User from '../models/User';
 import { generateToken } from '../middleware/auth';
-import { validate, registerSchema, loginSchema } from '../middleware/validation';
+import { authenticate } from '../middleware/auth';
+import { z } from 'zod';
 
 const router = Router();
+
+const registerSchema = z.object({
+  name: z.string().min(2).max(50),
+  email: z.string().email(),
+  password: z.string().min(6).max(100),
+  phone: z.string().optional(),
+});
+
+const loginSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(6).max(100),
+});
 
 // @route   POST /api/auth/register
 // @desc    Register a new user
 // @access  Public
-router.post('/register', validate(registerSchema), async (req: Request, res: Response) => {
+router.post('/register', async (req: Request, res: Response) => {
   try {
-    const { name, email, password, phone } = req.body;
+    const { name, email, password, phone } = registerSchema.parse(req.body);
 
     // Check if user already exists
     const existingUser = await User.findOne({ email });
@@ -50,8 +63,11 @@ router.post('/register', validate(registerSchema), async (req: Request, res: Res
       }
     });
 
-  } catch (error) {
+  } catch (error: any) {
     console.error('Registration error:', error);
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({ success: false, message: 'Invalid input', errors: error.errors });
+    }
     res.status(500).json({
       success: false,
       message: 'Internal server error during registration'
@@ -62,9 +78,9 @@ router.post('/register', validate(registerSchema), async (req: Request, res: Res
 // @route   POST /api/auth/login
 // @desc    Login user
 // @access  Public
-router.post('/login', validate(loginSchema), async (req: Request, res: Response) => {
+router.post('/login', async (req: Request, res: Response) => {
   try {
-    const { email, password } = req.body;
+    const { email, password } = loginSchema.parse(req.body);
 
     // Find user and include password for comparison
     const user = await User.findOne({ email }).select('+password');
@@ -111,8 +127,11 @@ router.post('/login', validate(loginSchema), async (req: Request, res: Response)
       }
     });
 
-  } catch (error) {
+  } catch (error: any) {
     console.error('Login error:', error);
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({ success: false, message: 'Invalid input', errors: error.errors });
+    }
     res.status(500).json({
       success: false,
       message: 'Internal server error during login'
@@ -123,7 +142,7 @@ router.post('/login', validate(loginSchema), async (req: Request, res: Response)
 // @route   GET /api/auth/me
 // @desc    Get current user
 // @access  Private
-router.get('/me', async (req: Request, res: Response) => {
+router.get('/me', authenticate, async (req: Request, res: Response) => {
   try {
     // This will be handled by the authenticate middleware
     const user = req.user!;
@@ -154,7 +173,7 @@ router.get('/me', async (req: Request, res: Response) => {
 // @route   PUT /api/auth/profile
 // @desc    Update user profile
 // @access  Private
-router.put('/profile', async (req: Request, res: Response) => {
+router.put('/profile', authenticate, async (req: Request, res: Response) => {
   try {
     const { name, phone } = req.body;
     const user = req.user!;

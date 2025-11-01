@@ -1,9 +1,10 @@
 import mongoose from 'mongoose';
 import { createIndexes } from './database-indexes';
+import env from './env';
 
 const connectDB = async (): Promise<void> => {
   try {
-    const mongoURI = process.env.MONGODB_URI || 'mongodb://localhost:27017/whatsapp-bulk-messaging';
+    const mongoURI = env.MONGODB_URI || 'mongodb://localhost:27017/whatsapp-bulk-messaging';
     
     const options = {
       maxPoolSize: 50, // Increased for high concurrency (from 20)

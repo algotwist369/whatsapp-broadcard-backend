@@ -80,14 +80,14 @@ router.get('/status', authenticate, async (req: Request, res: Response) => {
       dbStatus: user.whatsappConnected
     });
 
-    // If user has WhatsApp connected in database but no active connection, try to restore
+    // If user has WhatsApp connected in database but no active connection, check session
     if (user.whatsappConnected && !status.isConnected && status.state === 'not_connected') {
-      console.log('User has WhatsApp connected in DB but no active connection, attempting restore...');
+      console.log('User has WhatsApp connected in DB but no active connection');
       
       // Check if session files exist
       const hasSession = whatsappService.hasExistingSession(userId);
       if (!hasSession) {
-        console.log('No session files found, marking as disconnected');
+        console.log('No session files found, marking as disconnected - user needs to connect fresh');
         await User.findByIdAndUpdate(userId, { whatsappConnected: false });
         return res.json({
           success: true,
@@ -99,38 +99,33 @@ router.get('/status', authenticate, async (req: Request, res: Response) => {
         });
       }
       
+      // Session exists, try quick restoration (max 10 seconds)
+      console.log('Session files exist, attempting quick restoration...');
+      
       try {
-        // Start restoration in background to avoid blocking the response
-        console.log('Starting background restoration for user:', userId);
+        // Try restoration with timeout
+        const restorationPromise = whatsappService.restoreUserConnection(userId);
+        const timeoutPromise = new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('Restoration timeout')), 10000)
+        );
         
-        // Return immediately with restoring state
-        res.json({
-          success: true,
-          data: {
-            isConnected: false,
-            state: 'restoring',
-            qr: null
-          }
-        });
+        const restoreResult = await Promise.race([restorationPromise, timeoutPromise]);
         
-        // Restore connection in background
-        whatsappService.restoreUserConnection(userId).then((restoreResult) => {
-          if (restoreResult) {
-            console.log('✅ Background restoration completed for user:', userId);
-          } else {
-            console.log('❌ Background restoration failed for user:', userId);
-            User.findByIdAndUpdate(userId, { whatsappConnected: false });
-          }
-        }).catch((error) => {
-          console.error('❌ Background restoration error for user:', userId, error);
-          User.findByIdAndUpdate(userId, { whatsappConnected: false });
-        });
-        
-        // Already sent response, so return to avoid sending it twice
-        return;
+        if (restoreResult) {
+          console.log('✅ Quick restoration successful');
+          const newStatus = whatsappService.getConnectionStatus(userId);
+          return res.json({
+            success: true,
+            data: {
+              isConnected: newStatus.isConnected,
+              state: newStatus.state,
+              qr: null
+            }
+          });
+        }
       } catch (error) {
-        console.error('Error initiating restoration:', error);
-        // Update database if restoration fails
+        console.log('⚠️ Quick restoration failed or timed out, clearing session');
+        // Restoration failed - mark as disconnected so user can connect fresh
         await User.findByIdAndUpdate(userId, { whatsappConnected: false });
       }
     }
@@ -322,5 +317,6 @@ router.get('/debug', authenticate, async (req: Request, res: Response) => {
     });
   }
 });
+
 
 export default router;

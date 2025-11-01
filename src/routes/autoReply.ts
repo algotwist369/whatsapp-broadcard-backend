@@ -1,623 +1,479 @@
-import { Router, Request, Response } from 'express';
+import express from 'express';
 import { authenticate } from '../middleware/auth';
-import AutoReply from '../models/AutoReply';
-import AutoReplyLog from '../models/AutoReplyLog';
-import ReplyData from '../models/ReplyData';
-import Contact from '../models/Contact';
-import autoReplyService from '../services/autoReplyService';
-import aiService from '../services/aiService';
-import whatsappService from '../services/whatsappService';
-import multer from 'multer';
-import * as XLSX from 'xlsx';
-import path from 'path';
-import fs from 'fs';
+import SpaData from '../models/SpaData';
+import ConversationState from '../models/ConversationState';
+import ConversationHistory from '../models/ConversationHistory';
+import AutoReplyRule from '../models/AutoReplyRule';
 
-const router = Router();
+const router = express.Router();
 
-// Configure multer for file uploads
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const uploadDir = './uploads';
-    if (!fs.existsSync(uploadDir)) {
-      fs.mkdirSync(uploadDir, { recursive: true });
-    }
-    cb(null, uploadDir);
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, `reply-data-${uniqueSuffix}${path.extname(file.originalname)}`);
-  }
-});
+const formatPhone = (phone: string): string => {
+  let num = phone.replace(/\D/g, '');
+  if (num.startsWith('91')) return `+${num}`;
+  if (num.startsWith('0')) return `+91${num.slice(1)}`;
+  if (num.length === 10) return `+91${num}`;
+  return `+91${num}`;
+};
 
-const upload = multer({ 
-  storage,
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit
-  fileFilter: (req, file, cb) => {
-    const allowedTypes = ['.xlsx', '.xls', '.csv'];
-    const ext = path.extname(file.originalname).toLowerCase();
-    if (allowedTypes.includes(ext)) {
-      cb(null, true);
-    } else {
-      cb(new Error('Only Excel and CSV files are allowed'));
-    }
-  }
-});
-
-// @route   GET /api/auto-reply
-// @desc    Get all auto-replies for user
-// @access  Private
-router.get('/', authenticate, async (req: Request, res: Response) => {
+router.get('/spa-data', authenticate, async (req, res) => {
   try {
-    const user = req.user!;
-    const { page = 1, limit = 10, category, isActive } = req.query;
+    const userId = req.user!._id;
+    let spaData = await SpaData.findOne({ userId });
 
-    const query: any = { userId: user._id };
-    if (category) query.category = category;
-    if (isActive !== undefined) query.isActive = isActive === 'true';
-
-    const autoReplies = await AutoReply.find(query)
-      .sort({ priority: -1, createdAt: -1 })
-      .limit(parseInt(limit as string) * 1)
-      .skip((parseInt(page as string) - 1) * parseInt(limit as string));
-
-    const total = await AutoReply.countDocuments(query);
-
-    res.json({
-      success: true,
-      data: {
-        autoReplies,
-        total,
-        page: parseInt(page as string),
-        limit: parseInt(limit as string),
-        pages: Math.ceil(total / parseInt(limit as string))
-      }
-    });
-  } catch (error) {
-    console.error('Get auto-replies error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Internal server error'
-    });
-  }
-});
-
-// @route   POST /api/auto-reply
-// @desc    Create new auto-reply
-// @access  Private
-router.post('/', authenticate, async (req: Request, res: Response) => {
-  try {
-    const user = req.user!;
-    const autoReplyData = {
-      ...req.body,
-      userId: user._id
-    };
-
-    const autoReply = new AutoReply(autoReplyData);
-    await autoReply.save();
-
-    // Clear cache for this user
-    autoReplyService.clearUserCache(user._id.toString());
-
-    res.status(201).json({
-      success: true,
-      message: 'Auto-reply created successfully',
-      data: autoReply
-    });
-  } catch (error) {
-    console.error('Create auto-reply error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Internal server error'
-    });
-  }
-});
-
-// @route   PUT /api/auto-reply/:id
-// @desc    Update auto-reply
-// @access  Private
-router.put('/:id', authenticate, async (req: Request, res: Response) => {
-  try {
-    const user = req.user!;
-    const { id } = req.params;
-
-    const autoReply = await AutoReply.findOneAndUpdate(
-      { _id: id, userId: user._id },
-      req.body,
-      { new: true, runValidators: true }
-    );
-
-    if (!autoReply) {
-      return res.status(404).json({
-        success: false,
-        message: 'Auto-reply not found'
-      });
-    }
-
-    // Clear cache for this user
-    autoReplyService.clearUserCache(user._id.toString());
-
-    res.json({
-      success: true,
-      message: 'Auto-reply updated successfully',
-      data: autoReply
-    });
-  } catch (error) {
-    console.error('Update auto-reply error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Internal server error'
-    });
-  }
-});
-
-// @route   DELETE /api/auto-reply/:id
-// @desc    Delete auto-reply
-// @access  Private
-router.delete('/:id', authenticate, async (req: Request, res: Response) => {
-  try {
-    const user = req.user!;
-    const { id } = req.params;
-
-    const autoReply = await AutoReply.findOneAndDelete({
-      _id: id,
-      userId: user._id
-    });
-
-    if (!autoReply) {
-      return res.status(404).json({
-        success: false,
-        message: 'Auto-reply not found'
-      });
-    }
-
-    // Clear cache for this user
-    autoReplyService.clearUserCache(user._id.toString());
-
-    res.json({
-      success: true,
-      message: 'Auto-reply deleted successfully'
-    });
-  } catch (error) {
-    console.error('Delete auto-reply error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Internal server error'
-    });
-  }
-});
-
-// @route   POST /api/auto-reply/:id/toggle
-// @desc    Toggle auto-reply active status
-// @access  Private
-router.post('/:id/toggle', authenticate, async (req: Request, res: Response) => {
-  try {
-    const user = req.user!;
-    const { id } = req.params;
-
-    const autoReply = await AutoReply.findOne({ _id: id, userId: user._id });
-    if (!autoReply) {
-      return res.status(404).json({
-        success: false,
-        message: 'Auto-reply not found'
-      });
-    }
-
-    autoReply.isActive = !autoReply.isActive;
-    await autoReply.save();
-
-    // Clear cache for this user
-    autoReplyService.clearUserCache(user._id.toString());
-
-    res.json({
-      success: true,
-      message: `Auto-reply ${autoReply.isActive ? 'activated' : 'deactivated'} successfully`,
-      data: { isActive: autoReply.isActive }
-    });
-  } catch (error) {
-    console.error('Toggle auto-reply error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Internal server error'
-    });
-  }
-});
-
-// @route   GET /api/auto-reply/logs
-// @desc    Get auto-reply logs
-// @access  Private
-router.get('/logs', authenticate, async (req: Request, res: Response) => {
-  try {
-    const user = req.user!;
-    const { page = 1, limit = 20, status, autoReplyId } = req.query;
-
-    const query: any = { userId: user._id };
-    if (status) query.status = status;
-    if (autoReplyId) query.autoReplyId = autoReplyId;
-
-    const logs = await AutoReplyLog.find(query)
-      .populate('autoReplyId', 'name category')
-      .populate('contactId', 'name phone')
-      .sort({ createdAt: -1 })
-      .limit(parseInt(limit as string) * 1)
-      .skip((parseInt(page as string) - 1) * parseInt(limit as string));
-
-    const total = await AutoReplyLog.countDocuments(query);
-
-    res.json({
-      success: true,
-      data: {
-        logs,
-        total,
-        page: parseInt(page as string),
-        limit: parseInt(limit as string),
-        pages: Math.ceil(total / parseInt(limit as string))
-      }
-    });
-  } catch (error) {
-    console.error('Get auto-reply logs error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Internal server error'
-    });
-  }
-});
-
-// @route   POST /api/auto-reply/test
-// @desc    Test auto-reply with sample message
-// @access  Private
-router.post('/test', authenticate, async (req: Request, res: Response) => {
-  try {
-    const user = req.user!;
-    const { phoneNumber, message } = req.body;
-
-    if (!phoneNumber || !message) {
-      return res.status(400).json({
-        success: false,
-        message: 'Phone number and message are required'
-      });
-    }
-
-    // Check if WhatsApp is connected
-    if (!whatsappService.isConnected(user._id.toString())) {
-      return res.status(400).json({
-        success: false,
-        message: 'WhatsApp is not connected. Please connect first.'
-      });
-    }
-
-    const result = await autoReplyService.processIncomingMessage(
-      user._id.toString(),
-      phoneNumber,
-      message
-    );
-
-    res.json({
-      success: true,
-      data: result
-    });
-  } catch (error) {
-    console.error('Test auto-reply error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Internal server error'
-    });
-  }
-});
-
-// @route   GET /api/auto-reply/statistics
-// @desc    Get auto-reply statistics
-// @access  Private
-router.get('/statistics', authenticate, async (req: Request, res: Response) => {
-  try {
-    const user = req.user!;
-    const { period = '30' } = req.query;
-
-    const days = parseInt(period as string);
-    const startDate = new Date();
-    startDate.setDate(startDate.getDate() - days);
-
-    const stats = await AutoReplyLog.aggregate([
-      {
-        $match: {
-          userId: user._id,
-          createdAt: { $gte: startDate }
-        }
-      },
-      {
-        $group: {
-          _id: '$status',
-          count: { $sum: 1 }
-        }
-      }
-    ]);
-
-    const autoReplyStats = await AutoReply.aggregate([
-      {
-        $match: { userId: user._id }
-      },
-      {
-        $group: {
-          _id: null,
-          totalAutoReplies: { $sum: 1 },
-          activeAutoReplies: {
-            $sum: { $cond: ['$isActive', 1, 0] }
+    if (!spaData) {
+      spaData = new SpaData({
+        userId,
+        spaName: 'Aquam Spa',
+        location: 'Trivandrum, Kerala',
+        address: 'Your Spa Address',
+        phone: '+91 1234567890',
+        email: 'info@aquamspa.com',
+        adminPhone: '7388480128',
+        mapUrl: 'https://maps.app.goo.gl/1234567890',
+        discounts: 'First visit 20% off, next 10% off',
+        services: [
+          {
+            name: 'Swedish Massage',
+            description: 'Relaxing full-body massage with gentle strokes',
+            variants: [
+              { duration: 60, price: 1999 },
+              { duration: 90, price: 2799 },
+              { duration: 120, price: 3499 }
+            ],
+            benefits: ['Reduces stress', 'Improves circulation', 'Relieves muscle tension']
           },
-          totalTriggers: { $sum: '$statistics.totalTriggers' },
-          successfulReplies: { $sum: '$statistics.successfulReplies' },
-          failedReplies: { $sum: '$statistics.failedReplies' }
+          {
+            name: 'Deep Tissue Massage',
+            description: 'Therapeutic massage targeting deep muscle layers',
+            variants: [
+              { duration: 60, price: 2799 },
+              { duration: 90, price: 3799 }
+            ],
+            benefits: ['Reduces muscle stiffness', 'Relieves chronic pain']
+          },
+          {
+            name: 'Balinese Massage',
+            description: 'Traditional Indonesian massage with aromatic oils',
+            variants: [
+              { duration: 90, price: 3299 }
+            ],
+            benefits: ['Deep relaxation', 'Improved sleep']
+          },
+          {
+            name: 'Head Massage',
+            description: 'Relieves tension in head, neck & shoulders',
+            variants: [
+              { duration: 30, price: 999 },
+              { duration: 45, price: 1499 }
+            ],
+            benefits: ['Reduces headache', 'Improves focus']
+          }
+        ],
+        workingHours: [
+          { day: 'Monday', openTime: '09:00', closeTime: '21:00', isOpen: true },
+          { day: 'Tuesday', openTime: '09:00', closeTime: '21:00', isOpen: true },
+          { day: 'Wednesday', openTime: '09:00', closeTime: '21:00', isOpen: true },
+          { day: 'Thursday', openTime: '09:00', closeTime: '21:00', isOpen: true },
+          { day: 'Friday', openTime: '09:00', closeTime: '21:00', isOpen: true },
+          { day: 'Saturday', openTime: '09:00', closeTime: '21:00', isOpen: true },
+          { day: 'Sunday', openTime: '10:00', closeTime: '20:00', isOpen: true }
+        ],
+        autoReplySettings: {
+          isEnabled: false,
+          welcomeMessage: 'Hello! Thank you for reaching out to {spaName}. How can I help you today?',
+          fallbackMessage: 'I\'m sorry, I didn\'t understand that. Could you please rephrase your question?',
+          bookingConfirmationMessage: 'Thank you! Your booking has been successfully confirmed.',
+          adminNotificationMessage: 'New booking received: {customerName} - {service} - {date} at {time}'
+        }
+      });
+
+      await spaData.save();
+    } else {
+      let migrated = false;
+      for (const service of spaData.services) {
+        const legacy = service as any;
+        if (legacy.duration && legacy.price && !service.variants) {
+          service.variants = [{ duration: legacy.duration, price: legacy.price }];
+          delete legacy.duration;
+          delete legacy.price;
+          migrated = true;
         }
       }
-    ]);
+      if (migrated) {
+        spaData.markModified('services');
+        await spaData.save();
+      }
+    }
+
+    res.json({
+      success: true,
+      data: spaData
+    });
+  } catch (error: any) {
+    console.error('Error getting spa data:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching spa data',
+      error: error.message
+    });
+  }
+});
+
+router.put('/spa-data', authenticate, async (req, res) => {
+  try {
+    const userId = req.user!._id;
+    const updateData = req.body;
+
+    if (updateData.services) {
+      for (const service of updateData.services) {
+        if (!service.variants || !Array.isArray(service.variants) || service.variants.length === 0) {
+          return res.status(400).json({
+            success: false,
+            message: `Service "${service.name}" must have at least one duration & price.`
+          });
+        }
+        for (const v of service.variants) {
+          if (!v.duration || !v.price || v.duration < 15 || v.price < 0) {
+            return res.status(400).json({
+              success: false,
+              message: `Invalid variant for "${service.name}". Duration ≥ 15 min, Price ≥ 0.`
+            });
+          }
+        }
+      }
+    }
+
+    const spaData = await SpaData.findOneAndUpdate(
+      { userId },
+      updateData,
+      { new: true, upsert: true, runValidators: true }
+    );
+
+    res.json({
+      success: true,
+      data: spaData,
+      message: 'Spa data updated successfully'
+    });
+  } catch (error: any) {
+    console.error('Error updating spa data:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error updating spa data',
+      error: error.message
+    });
+  }
+});
+
+router.post('/toggle', authenticate, async (req, res) => {
+  try {
+    const userId = req.user!._id;
+    const { isEnabled } = req.body;
+
+    const spaData = await SpaData.findOneAndUpdate(
+      { userId },
+      { 'autoReplySettings.isEnabled': isEnabled },
+      { new: true }
+    );
+
+    if (!spaData) {
+      return res.status(404).json({
+        success: false,
+        message: 'Spa data not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      data: { isEnabled: spaData.autoReplySettings.isEnabled },
+      message: `Auto-reply ${isEnabled ? 'enabled' : 'disabled'} successfully`
+    });
+  } catch (error: any) {
+    console.error('Error toggling auto-reply:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error toggling auto-reply',
+      error: error.message
+    });
+  }
+});
+
+router.get('/conversations', authenticate, async (req, res) => {
+  try {
+    const userId = req.user!._id;
+
+    const conversations = await ConversationState.find({ userId, isActive: true })
+      .select({
+        customerPhone: 1,
+        currentStep: 1,
+        'context.customerName': 1,
+        'context.selectedService': 1,
+        'context.preferredDate': 1,
+        'context.preferredTime': 1,
+        'context.dailyMessageCount': 1,
+        'context.bookingConfirmed': 1,
+        'context.bookingCancelled': 1,
+        'context.flags.therapistQuery': 1,
+        'context.lastActivity': 1,
+        'context.flags.assistantName': 1
+      })
+      .sort({ 'context.lastActivity': -1 })
+      .lean();
+
+    const formatted = conversations.map(c => ({
+      phone: formatPhone(c.customerPhone),
+      name: c.context?.customerName || 'Guest',
+      step: c.currentStep,
+      service: c.context?.selectedService?.name || '—',
+      duration: c.context?.selectedService?.duration ? `${c.context.selectedService.duration} min` : '—',
+      price: c.context?.selectedService?.price ? `₹${c.context.selectedService.price}` : '—',
+      date: c.context?.preferredDate || '—',
+      time: c.context?.preferredTime || '—',
+      dailyMessages: c.context?.dailyMessageCount || 0,
+      bookingStatus: c.context?.bookingConfirmed ? 'Confirmed' : c.context?.bookingCancelled ? 'Cancelled' : 'In Progress',
+      therapistQuery: c.context?.flags?.therapistQuery || false,
+      lastActivity: c.context?.lastActivity,
+      assistantName: c.context?.flags?.assistantName || 'Kiara'
+    }));
+
+    res.json({
+      success: true,
+      data: formatted
+    });
+  } catch (error: any) {
+    console.error('Error getting conversations:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching conversations',
+      error: error.message
+    });
+  }
+});
+
+router.get('/conversations/:phone', authenticate, async (req, res) => {
+  try {
+    const userId = req.user!._id;
+    const { phone } = req.params;
+    const { limit = 50 } = req.query;
+
+    const history = await ConversationHistory.find({ userId, customerPhone: phone })
+      .sort({ timestamp: -1 })
+      .limit(parseInt(limit as string))
+      .select('messageType message aiResponse step timestamp context')
+      .lean();
+
+    const state = await ConversationState.findOne({ userId, customerPhone: phone, isActive: true })
+      .select('currentStep context')
+      .lean();
 
     res.json({
       success: true,
       data: {
-        period: `${days} days`,
-        logStats: stats,
-        autoReplyStats: autoReplyStats[0] || {
-          totalAutoReplies: 0,
-          activeAutoReplies: 0,
-          totalTriggers: 0,
-          successfulReplies: 0,
-          failedReplies: 0
+        history: history.reverse().map(h => ({
+          type: h.messageType,
+          message: h.message,
+          aiResponse: h.aiResponse,
+          step: h.step,
+          context: h.context,
+          time: h.timestamp
+        })),
+        currentState: {
+          step: state?.currentStep || 'ended',
+          context: state?.context || {}
         }
       }
     });
-  } catch (error) {
-    console.error('Get auto-reply statistics error:', error);
+  } catch (error: any) {
+    console.error('Error getting conversation history:', error);
     res.status(500).json({
       success: false,
-      message: 'Internal server error'
+      message: 'Error fetching conversation history',
+      error: error.message
     });
   }
 });
 
-// Reply Data Routes
-
-// @route   GET /api/auto-reply/data
-// @desc    Get reply data sets
-// @access  Private
-router.get('/data', authenticate, async (req: Request, res: Response) => {
+router.post('/conversations/:phone/end', authenticate, async (req, res) => {
   try {
-    const user = req.user!;
-    const { page = 1, limit = 10, category, dataType } = req.query;
+    const userId = req.user!._id;
+    const { phone } = req.params;
 
-    const query: any = { userId: user._id };
-    if (category) query.category = category;
-    if (dataType) query.dataType = dataType;
-
-    const replyData = await ReplyData.find(query)
-      .sort({ createdAt: -1 })
-      .limit(parseInt(limit as string) * 1)
-      .skip((parseInt(page as string) - 1) * parseInt(limit as string));
-
-    const total = await ReplyData.countDocuments(query);
+    await ConversationState.findOneAndUpdate(
+      { userId, customerPhone: phone, isActive: true },
+      {
+        isActive: false,
+        $set: {
+          'context.dailyMessageCount': 0,
+          'context.lastMessageDate': null,
+          'context.bookingConfirmed': false,
+          'context.bookingCancelled': false,
+          'context.flags.therapistQuery': false,
+          'context.browserQuestionCount': 0,
+          'context.lastUserMessage': '',
+          'context.lastAiMessage': '',
+          'context.lastAiAt': null,
+          'context.suppressWelcomeUntil': null
+        }
+      }
+    );
 
     res.json({
       success: true,
-      data: {
-        replyData,
-        total,
-        page: parseInt(page as string),
-        limit: parseInt(limit as string),
-        pages: Math.ceil(total / parseInt(limit as string))
-      }
+      message: 'Conversation ended and context reset'
     });
-  } catch (error) {
-    console.error('Get reply data error:', error);
+  } catch (error: any) {
+    console.error('Error ending conversation:', error);
     res.status(500).json({
       success: false,
-      message: 'Internal server error'
+      message: 'Error ending conversation',
+      error: error.message
     });
   }
 });
 
-// @route   POST /api/auto-reply/data
-// @desc    Create new reply data set
-// @access  Private
-router.post('/data', authenticate, async (req: Request, res: Response) => {
+router.get('/reminders', authenticate, async (req, res) => {
   try {
-    const user = req.user!;
-    const replyData = new ReplyData({
-      ...req.body,
-      userId: user._id
-    });
+    const userId = req.user!._id;
 
-    await replyData.save();
+    const states = await ConversationState.find({
+      userId,
+      isActive: true,
+      'context.bookingConfirmed': true
+    })
+      .select('customerPhone context')
+      .lean();
 
-    // Clear cache for this user
-    autoReplyService.clearUserCache(user._id.toString());
+    const pending = states
+      .map(s => {
+        const ctx = s.context as any;
+        // Placeholder logic; replace with date-fns for real parsing
+        const isSoon = Math.random() < 0.1; // Demo
+        if (isSoon) {
+          return {
+            phone: formatPhone(s.customerPhone),
+            name: ctx.customerName || 'Guest',
+            service: ctx.selectedService?.name,
+            dateTime: `${ctx.preferredDate} ${ctx.preferredTime}`,
+            lastActivity: ctx.lastActivity
+          };
+        }
+      })
+      .filter(Boolean);
 
-    res.status(201).json({
+    res.json({
       success: true,
-      message: 'Reply data created successfully',
-      data: replyData
+      data: pending,
+      count: pending.length
     });
-  } catch (error) {
-    console.error('Create reply data error:', error);
+  } catch (error: any) {
+    console.error('Error getting reminders:', error);
     res.status(500).json({
       success: false,
-      message: 'Internal server error'
+      message: 'Error fetching reminders',
+      error: error.message
     });
   }
 });
 
-// @route   POST /api/auto-reply/data/upload
-// @desc    Upload Excel file and import reply data
-// @access  Private
-router.post('/data/upload', authenticate, upload.single('file'), async (req: Request, res: Response) => {
+router.get('/rules', authenticate, async (req, res) => {
   try {
-    const user = req.user!;
-    const { name, description, category } = req.body;
+    const userId = req.user!._id;
+    const rules = await AutoReplyRule.find({ userId }).sort({ priority: -1 });
 
-    if (!req.file) {
-      return res.status(400).json({
-        success: false,
-        message: 'No file uploaded'
-      });
-    }
-
-    // Read Excel file
-    const workbook = XLSX.readFile(req.file.path);
-    const sheetName = workbook.SheetNames[0];
-    const worksheet = workbook.Sheets[sheetName];
-    const jsonData = XLSX.utils.sheet_to_json(worksheet);
-
-    if (jsonData.length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: 'No data found in the Excel file'
-      });
-    }
-
-    // Process the data
-    const processedData = jsonData.map((row: any, index: number) => {
-      const keys = Object.keys(row);
-      const keyColumn = keys.find(k => 
-        k.toLowerCase().includes('question') || 
-        k.toLowerCase().includes('key') || 
-        k.toLowerCase().includes('trigger')
-      ) || keys[0];
-      
-      const valueColumn = keys.find(k => 
-        k.toLowerCase().includes('answer') || 
-        k.toLowerCase().includes('value') || 
-        k.toLowerCase().includes('response')
-      ) || keys[1];
-
-      return {
-        key: String(row[keyColumn] || ''),
-        value: String(row[valueColumn] || ''),
-        context: String(row.context || ''),
-        tags: String(row.tags || '').split(',').map(t => t.trim()).filter(t => t),
-        priority: parseInt(row.priority) || 1
-      };
-    }).filter(item => item.key && item.value);
-
-    // Create reply data record
-    const replyData = new ReplyData({
-      userId: user._id,
-      name: name || `Imported Data ${new Date().toISOString()}`,
-      description: description || 'Imported from Excel file',
-      category: category || 'general',
-      dataType: 'excel_import',
-      sourceFile: req.file.originalname,
-      data: processedData,
-      importMetadata: {
-        totalRows: jsonData.length,
-        importedRows: processedData.length,
-        skippedRows: jsonData.length - processedData.length,
-        importDate: new Date(),
-        fileSize: req.file.size,
-        columns: Object.keys(jsonData[0] || {})
-      }
-    });
-
-    await replyData.save();
-
-    // Clean up uploaded file
-    fs.unlinkSync(req.file.path);
-
-    // Clear cache for this user
-    autoReplyService.clearUserCache(user._id.toString());
-
-    res.status(201).json({
+    res.json({
       success: true,
-      message: 'Reply data imported successfully',
-      data: {
-        id: replyData._id,
-        name: replyData.name,
-        totalRows: replyData.importMetadata?.totalRows,
-        importedRows: replyData.importMetadata?.importedRows,
-        skippedRows: replyData.importMetadata?.skippedRows
-      }
+      data: rules
     });
-  } catch (error) {
-    console.error('Upload reply data error:', error);
-    
-    // Clean up file if it exists
-    if (req.file && fs.existsSync(req.file.path)) {
-      fs.unlinkSync(req.file.path);
-    }
-    
+  } catch (error: any) {
+    console.error('Error getting auto-reply rules:', error);
     res.status(500).json({
       success: false,
-      message: 'Internal server error'
+      message: 'Error fetching auto-reply rules',
+      error: error.message
     });
   }
 });
 
-// @route   POST /api/auto-reply/data/:id/test
-// @desc    Test reply data with sample message
-// @access  Private
-router.post('/data/:id/test', authenticate, async (req: Request, res: Response) => {
+router.post('/rules', authenticate, async (req, res) => {
   try {
-    const user = req.user!;
+    const userId = req.user!._id;
+    const ruleData = { ...req.body, userId };
+
+    const rule = new AutoReplyRule(ruleData);
+    await rule.save();
+
+    res.json({
+      success: true,
+      data: rule,
+      message: 'Auto-reply rule created successfully'
+    });
+  } catch (error: any) {
+    console.error('Error creating auto-reply rule:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error creating auto-reply rule',
+      error: error.message
+    });
+  }
+});
+
+router.put('/rules/:id', authenticate, async (req, res) => {
+  try {
+    const userId = req.user!._id;
     const { id } = req.params;
-    const { message } = req.body;
+    const updateData = req.body;
 
-    if (!message) {
-      return res.status(400).json({
-        success: false,
-        message: 'Message is required'
-      });
-    }
+    const rule = await AutoReplyRule.findOneAndUpdate(
+      { _id: id, userId },
+      updateData,
+      { new: true }
+    );
 
-    const replyData = await ReplyData.findOne({ _id: id, userId: user._id });
-    if (!replyData) {
+    if (!rule) {
       return res.status(404).json({
         success: false,
-        message: 'Reply data not found'
+        message: 'Auto-reply rule not found'
       });
     }
 
-    // Removed: findBestReplyFromData method - no longer using manual data
-    // System now uses PDF RAG only
     res.json({
-      success: false,
-      message: 'Manual data system removed. Please use Knowledge Base with PDFs instead.'
+      success: true,
+      data: rule,
+      message: 'Auto-reply rule updated successfully'
     });
-  } catch (error) {
-    console.error('Test reply data error:', error);
+  } catch (error: any) {
+    console.error('Error updating auto-reply rule:', error);
     res.status(500).json({
       success: false,
-      message: 'Internal server error'
+      message: 'Error updating auto-reply rule',
+      error: error.message
     });
   }
 });
 
-// @route   DELETE /api/auto-reply/data/:id
-// @desc    Delete reply data set
-// @access  Private
-router.delete('/data/:id', authenticate, async (req: Request, res: Response) => {
+router.delete('/rules/:id', authenticate, async (req, res) => {
   try {
-    const user = req.user!;
+    const userId = req.user!._id;
     const { id } = req.params;
 
-    const replyData = await ReplyData.findOneAndDelete({
-      _id: id,
-      userId: user._id
-    });
+    const rule = await AutoReplyRule.findOneAndDelete({ _id: id, userId });
 
-    if (!replyData) {
+    if (!rule) {
       return res.status(404).json({
         success: false,
-        message: 'Reply data not found'
+        message: 'Auto-reply rule not found'
       });
     }
 
-    // Clear cache for this user
-    autoReplyService.clearUserCache(user._id.toString());
-
     res.json({
       success: true,
-      message: 'Reply data deleted successfully'
+      message: 'Auto-reply rule deleted successfully'
     });
-  } catch (error) {
-    console.error('Delete reply data error:', error);
+  } catch (error: any) {
+    console.error('Error deleting auto-reply rule:', error);
     res.status(500).json({
       success: false,
-      message: 'Internal server error'
+      message: 'Error deleting auto-reply rule',
+      error: error.message
     });
   }
 });

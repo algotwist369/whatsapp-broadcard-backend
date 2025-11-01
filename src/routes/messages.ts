@@ -1,18 +1,14 @@
 import { Router, Request, Response } from 'express';
 import { authenticate } from '../middleware/auth';
-import { validate, bulkMessageSchema } from '../middleware/validation';
 import Contact from '../models/Contact';
 import Message from '../models/Message';
 import BulkMessage from '../models/BulkMessage';
 import aiService from '../services/aiService';
 import whatsappService from '../services/whatsappService';
 import Bull from 'bull';
-import { getConfig } from '../config/production';
-
 const router = Router();
-const config = getConfig();
 
-// Create Bull queue for message processing with production configuration
+// Create Bull queue for message processing
 const messageQueue = new Bull('message processing', {
   redis: {
     host: process.env.REDIS_HOST || 'localhost',
@@ -20,18 +16,18 @@ const messageQueue = new Bull('message processing', {
     password: process.env.REDIS_PASSWORD,
   },
   defaultJobOptions: {
-    removeOnComplete: config.messageQueue.removeOnComplete,
-    removeOnFail: config.messageQueue.removeOnFail,
-    attempts: config.messageQueue.maxRetries,
+    removeOnComplete: 100,
+    removeOnFail: 50,
+    attempts: 3,
     backoff: {
       type: 'exponential' as const,
-      delay: config.messageQueue.retryBackoff.delay,
+      delay: 2000,
     },
-    timeout: config.messageQueue.timeout,
+    timeout: 30000,
   },
   settings: {
-    stalledInterval: config.messageQueue.stalledInterval,
-    maxStalledCount: config.messageQueue.maxStalledCount,
+    stalledInterval: 30000,
+    maxStalledCount: 1,
   },
 });
 
@@ -76,10 +72,25 @@ router.post('/analyze', authenticate, async (req: Request, res: Response) => {
 // @route   POST /api/messages/send-bulk
 // @desc    Send bulk messages with AI processing
 // @access  Private
-router.post('/send-bulk', authenticate, validate(bulkMessageSchema), async (req: Request, res: Response) => {
+router.post('/send-bulk', authenticate, async (req: Request, res: Response) => {
   try {
     const user = req.user!;
     const { message, category, selectedContacts } = req.body;
+
+    // Debug logging
+    console.log('📤 Bulk message request:', { 
+      message: message?.substring(0, 50) + '...', 
+      category, 
+      selectedContactsCount: selectedContacts?.length 
+    });
+
+    // Validate required fields
+    if (!message || !category || !selectedContacts || selectedContacts.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Missing required fields: message, category, and selectedContacts are required'
+      });
+    }
 
     // Check if WhatsApp is connected
     const userId = user._id.toString();
@@ -548,7 +559,7 @@ router.get('/statistics', authenticate, async (req: Request, res: Response) => {
 });
 
 // Process message queue with production-level concurrency
-messageQueue.process('send-message', config.messageQueue.concurrency, async (job) => {
+messageQueue.process('send-message', 5, async (job) => {
   const { messageId, bulkMessageId, userId, contactPhone, message, contactIndex, totalContacts } = job.data;
 
   try {
@@ -560,7 +571,7 @@ messageQueue.process('send-message', config.messageQueue.concurrency, async (job
     // Send WhatsApp message with timeout protection
     const sendPromise = whatsappService.sendMessage(userId, contactPhone, message);
     const timeoutPromise = new Promise<{ success: boolean; error: string }>((_, reject) => 
-      setTimeout(() => reject(new Error('Message send timeout')), config.whatsapp.messageTimeout)
+      setTimeout(() => reject(new Error('Message send timeout')), 30000)
     );
     
     const result = await Promise.race([sendPromise, timeoutPromise]);
